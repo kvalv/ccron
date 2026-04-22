@@ -227,46 +227,49 @@ func cmdValidate() *cli.Command {
 
 func cmdLogs() *cli.Command {
 	return &cli.Command{
-		Name:      "logs",
-		Usage:     "Show logs for a job (latest run by default)",
-		ArgsUsage: "<job-name>",
+		Name:  "logs",
+		Usage: "Show recent run logs across all jobs (optionally filtered by --job)",
 		Flags: []cli.Flag{
+			&cli.StringFlag{
+				Name:  "job",
+				Usage: "filter to a single job by name",
+			},
 			&cli.IntFlag{
 				Name:    "tail",
 				Aliases: []string{"n"},
 				Value:   1,
 				Usage:   "number of recent runs to show",
 			},
-			&cli.BoolFlag{
-				Name:  "list",
-				Usage: "list log files instead of showing content",
-			},
 		},
 		Action: func(ctx context.Context, cmd *cli.Command) error {
-			if cmd.NArg() == 0 {
-				return fmt.Errorf("job name required")
-			}
 			_, _, runner, err := loadFromCtx(ctx, cmd)
 			if err != nil {
 				return err
 			}
 
-			name := cmd.Args().First()
+			jobFilter := cmd.String("job")
 			n := int(cmd.Int("tail"))
 
-			logs, err := runner.ListLogs(name, n)
+			var logs []string
+			if jobFilter != "" {
+				logs, err = runner.ListLogs(jobFilter, n)
+			} else {
+				logs, err = runner.ListAllLogs(n)
+			}
 			if err != nil {
 				return err
 			}
-			if cmd.Bool("list") {
-				for _, l := range logs {
-					fmt.Println(l)
-				}
-				return nil
-			}
+
 			for _, l := range logs {
-				if n > 1 {
-					fmt.Printf("=== %s ===\n", filepath.Base(l))
+				// Header (job/filename) when printing more than one file so
+				// the reader can tell runs apart — especially when they're
+				// from different jobs.
+				if len(logs) > 1 {
+					rel, relErr := filepath.Rel(runner.LogDir, l)
+					if relErr != nil {
+						rel = filepath.Base(l)
+					}
+					fmt.Printf("=== %s ===\n", rel)
 				}
 				data, err := os.ReadFile(l)
 				if err != nil {

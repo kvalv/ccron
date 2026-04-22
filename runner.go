@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"syscall"
 	"time"
@@ -295,6 +296,54 @@ func (r *Runner) ListLogs(jobName string, limit int) ([]string, error) {
 	}
 	for _, e := range entries[start:] {
 		paths = append(paths, filepath.Join(jobDir, e.Name()))
+	}
+	return paths, nil
+}
+
+// ListAllLogs returns log file paths across every job, sorted by modtime
+// (most recent last), limited to the most recent `limit` entries. A missing
+// log dir is not an error (returns no paths).
+func (r *Runner) ListAllLogs(limit int) ([]string, error) {
+	entries, err := os.ReadDir(r.LogDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("read log dir: %w", err)
+	}
+	type logFile struct {
+		path    string
+		modTime time.Time
+	}
+	var files []logFile
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		jobDir := filepath.Join(r.LogDir, e.Name())
+		sub, err := os.ReadDir(jobDir)
+		if err != nil {
+			continue
+		}
+		for _, f := range sub {
+			if f.IsDir() || !strings.HasSuffix(f.Name(), ".log") {
+				continue
+			}
+			info, err := f.Info()
+			if err != nil {
+				continue
+			}
+			files = append(files, logFile{filepath.Join(jobDir, f.Name()), info.ModTime()})
+		}
+	}
+	sort.Slice(files, func(i, j int) bool { return files[i].modTime.Before(files[j].modTime) })
+	start := 0
+	if limit > 0 && len(files) > limit {
+		start = len(files) - limit
+	}
+	var paths []string
+	for _, f := range files[start:] {
+		paths = append(paths, f.path)
 	}
 	return paths, nil
 }

@@ -2,8 +2,11 @@ package main
 
 import (
 	"bytes"
+	"context"
+	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -19,6 +22,7 @@ type Job struct {
 	AllowedTools []string
 	Description  string
 	Timeout      time.Duration
+	EnabledIf    string
 	Prompt       string
 }
 
@@ -37,6 +41,7 @@ type frontmatter struct {
 	AllowedTools []string `yaml:"allowed_tools"`
 	Description  string   `yaml:"description"`
 	Timeout      string   `yaml:"timeout"`
+	EnabledIf    string   `yaml:"enabled_if"`
 }
 
 // LoadJobs walks dir non-recursively, parsing each *.md file. Per-file parse
@@ -121,8 +126,30 @@ func parseJobFile(path string) (Job, error) {
 		AllowedTools: front.AllowedTools,
 		Description:  front.Description,
 		Timeout:      timeout,
+		EnabledIf:    front.EnabledIf,
 		Prompt:       prompt,
 	}, nil
+}
+
+// CheckEnabled evaluates the job's enabled_if shell condition. Returns true
+// when there's no condition or when `sh -c <enabled_if>` exits 0. A non-zero
+// exit means disabled (not an error). Any other failure (couldn't spawn sh,
+// etc.) is returned as err.
+func (j Job) CheckEnabled(ctx context.Context) (bool, error) {
+	if j.EnabledIf == "" {
+		return true, nil
+	}
+	cmd := exec.CommandContext(ctx, "sh", "-c", j.EnabledIf)
+	cmd.Dir = j.Workdir
+	err := cmd.Run()
+	if err == nil {
+		return true, nil
+	}
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) {
+		return false, nil
+	}
+	return false, err
 }
 
 // splitFrontmatter extracts the first YAML frontmatter block delimited by "---"

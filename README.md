@@ -26,6 +26,7 @@ allowed_tools: [Read, Write, Bash, "mcp__github__*"]
 # optional
 description: Daily git activity summary
 timeout: 15m
+enabled_if: '[ "$(hostname)" = "work-laptop" ]'
 ---
 
 Summarize yesterday's git activity across all repos.
@@ -36,16 +37,17 @@ The preamble is YAML between `---` fences. The body (everything after the closin
 
 `allowed_tools` entries are passed to `--allowedTools`. Glob patterns with `*` are supported for MCP tools (e.g. `mcp__github__*` allows every tool exposed by the `github` MCP server).
 
+`enabled_if` is an optional shell expression evaluated with `sh -c` on every scheduled tick, with the job's `workdir` as cwd. Exit 0 runs the job, any non-zero exit silently skips it. This is intended for jobs whose files are synced across machines (Syncthing, dotfiles repos, etc.) where you want a host/user gate. `ccron exec <job>` bypasses this check — it's a manual override.
+
 ## Usage
 
 ```bash
-ccron                     # status for each job (last run, next run, duration, failures)
-ccron start               # run as daemon
-ccron exec <job>          # run a job immediately
-ccron validate            # parse all job files and report errors
-ccron logs <job>          # show latest run log
-ccron logs <job> -n 5     # show last 5 run logs
-ccron logs <job> --list   # list log file paths
+ccron                          # status for each job (last run, next run, duration, failures)
+ccron start                    # run as daemon
+ccron exec <job>               # run a job immediately
+ccron validate                 # parse all job files and report errors
+ccron logs                     # show latest run log (across all jobs)
+ccron logs --job <job> -n 5    # last 5 runs of a specific job
 ```
 
 Running `ccron` with no arguments prints a status table. If any job file fails to parse, it's reported there too - no need to start the daemon to find out.
@@ -56,14 +58,17 @@ Cron expressions evaluate in the system's local timezone.
 
 ## Run as a systemd user service
 
+Put the binary somewhere on `PATH` (e.g. `~/.local/bin/ccron`), then drop this unit at `~/.config/systemd/user/ccron.service`:
+
 ```ini
-# ~/.config/systemd/user/ccron.service
 [Unit]
 Description=ccron - Claude Code cron scheduler
 
 [Service]
-Environment=PATH=%h/.claude/local:%h/scripts:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
-ExecStart=%h/scripts/ccron start
+# ccron shells out to `claude`, so its directory needs to be on PATH. Adjust
+# this line if `claude` lives somewhere else on your system.
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=%h/.local/bin/ccron start
 ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=10
@@ -72,10 +77,15 @@ RestartSec=10
 WantedBy=default.target
 ```
 
+Then:
+
 ```bash
+systemctl --user daemon-reload
 systemctl --user enable --now ccron
 systemctl --user reload ccron   # reload jobs (SIGHUP)
 ```
+
+If `claude` isn't on the default `PATH` (e.g. it's in `~/.claude/local/`, installed via nvm, etc.), prepend that directory to the `Environment=PATH=...` line so the child process can find it.
 
 ## Logs
 

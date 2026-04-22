@@ -64,9 +64,19 @@ func (s *Scheduler) addLocked(job Job) error {
 }
 
 // runFunc returns the closure the cron library calls on each tick. Skips the
-// run if the same job is still executing from a previous tick.
+// run if enabled_if evaluates false, or if the same job is still executing
+// from a previous tick.
 func (s *Scheduler) runFunc(job Job) func() {
 	return func() {
+		enabled, err := job.CheckEnabled(s.ctx)
+		if err != nil {
+			log.Printf("enabled_if for %q failed to evaluate: %v", job.Name, err)
+			return
+		}
+		if !enabled {
+			return
+		}
+
 		s.mu.Lock()
 		if s.running[job.Name] {
 			s.mu.Unlock()
@@ -191,8 +201,9 @@ func jobHash(j Job) string {
 		Workdir      string
 		AllowedTools []string
 		Timeout      time.Duration
+		EnabledIf    string
 		Prompt       string
-	}{j.Schedule, j.Workdir, j.AllowedTools, j.Timeout, j.Prompt})
+	}{j.Schedule, j.Workdir, j.AllowedTools, j.Timeout, j.EnabledIf, j.Prompt})
 	sum := sha256.Sum256(payload)
 	return hex.EncodeToString(sum[:])
 }

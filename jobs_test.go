@@ -262,6 +262,32 @@ no workdir
 	}
 }
 
+func TestJob_CheckEnabled(t *testing.T) {
+	cases := []struct {
+		desc      string
+		enabledIf string
+		want      bool
+	}{
+		{"empty means enabled", "", true},
+		{"true command enables", "true", true},
+		{"false command disables", "false", false},
+		{"hostname match", `[ -n "$PATH" ]`, true},
+		{"impossible condition disables", `[ 1 -eq 2 ]`, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.desc, func(t *testing.T) {
+			j := Job{Workdir: os.TempDir(), EnabledIf: tc.enabledIf}
+			got, err := j.CheckEnabled(t.Context())
+			if err != nil {
+				t.Fatalf("CheckEnabled: %v", err)
+			}
+			if got != tc.want {
+				t.Fatalf("got %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestLoadJobs_UnreadableDir(t *testing.T) {
 	_, _, err := LoadJobs(filepath.Join(t.TempDir(), "does-not-exist"))
 	if err == nil {

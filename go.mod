@@ -1,4 +1,4 @@
-module github.com/kvalv/claude-cronjob
+module github.com/kvalv/ccron
 
 go 1.25.5
 

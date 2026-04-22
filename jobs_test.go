@@ -1,0 +1,301 @@
+package main
+
+import (
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+)
+
+func writeJob(t *testing.T, dir, name, content string) {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0o644); err != nil {
+		t.Fatalf("write %s: %v", name, err)
+	}
+}
+
+func TestLoadJobs(t *testing.T) {
+	const validMin = `---
+schedule: "*/5 * * * *"
+workdir: /tmp
+allowed_tools: [Read]
+---
+do the thing
+`
+
+	const validFull = `---
+schedule: "0 9 * * 1-5"
+workdir: ~/projects
+allowed_tools: [Read, Write, "mcp__github__*"]
+description: daily summary
+timeout: 15m
+---
+Summarize yesterday's activity.
+`
+
+	cases := []struct {
+		desc    string
+		content string
+		check   func(t *testing.T, j Job, err error)
+	}{
+		{
+			desc:    "valid minimum",
+			content: validMin,
+			check: func(t *testing.T, j Job, err error) {
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				if j.Schedule != "*/5 * * * *" || j.Workdir != "/tmp" || j.Prompt != "do the thing" {
+					t.Fatalf("bad job: %+v", j)
+				}
+				if len(j.AllowedTools) != 1 || j.AllowedTools[0] != "Read" {
+					t.Fatalf("bad allowed_tools: %v", j.AllowedTools)
+				}
+				if j.Timeout != 0 {
+					t.Fatalf("expected zero timeout, got %v", j.Timeout)
+				}
+			},
+		},
+		{
+			desc:    "valid full",
+			content: validFull,
+			check: func(t *testing.T, j Job, err error) {
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				if j.Description != "daily summary" {
+					t.Fatalf("description: %q", j.Description)
+				}
+				if j.Timeout != 15*time.Minute {
+					t.Fatalf("timeout: %v", j.Timeout)
+				}
+				home, _ := os.UserHomeDir()
+				if j.Workdir != filepath.Join(home, "projects") {
+					t.Fatalf("workdir not expanded: %q", j.Workdir)
+				}
+				if len(j.AllowedTools) != 3 || j.AllowedTools[2] != "mcp__github__*" {
+					t.Fatalf("allowed_tools: %v", j.AllowedTools)
+				}
+			},
+		},
+		{
+			desc: "missing schedule",
+			content: `---
+workdir: /tmp
+allowed_tools: [Read]
+---
+body
+`,
+			check: errContains("schedule"),
+		},
+		{
+			desc: "missing workdir",
+			content: `---
+schedule: "* * * * *"
+allowed_tools: [Read]
+---
+body
+`,
+			check: errContains("workdir"),
+		},
+		{
+			desc: "missing allowed_tools",
+			content: `---
+schedule: "* * * * *"
+workdir: /tmp
+---
+body
+`,
+			check: errContains("allowed_tools"),
+		},
+		{
+			desc: "invalid schedule",
+			content: `---
+schedule: "not a cron"
+workdir: /tmp
+allowed_tools: [Read]
+---
+body
+`,
+			check: errContains("schedule"),
+		},
+		{
+			desc: "invalid timeout",
+			content: `---
+schedule: "* * * * *"
+workdir: /tmp
+allowed_tools: [Read]
+timeout: "not-a-duration"
+---
+body
+`,
+			check: errContains("timeout"),
+		},
+		{
+			desc: "invalid yaml",
+			content: `---
+schedule: "* * * * *"
+workdir: /tmp
+allowed_tools: [Read
+---
+body
+`,
+			check: errContains("frontmatter"),
+		},
+		{
+			desc:    "missing opening fence",
+			content: "schedule: whatever\n---\nbody\n",
+			check:   errContains("opening"),
+		},
+		{
+			desc: "missing closing fence",
+			content: `---
+schedule: "* * * * *"
+workdir: /tmp
+allowed_tools: [Read]
+
+body with no closing fence
+`,
+			check: errContains("closing"),
+		},
+		{
+			desc: "empty prompt body",
+			content: `---
+schedule: "* * * * *"
+workdir: /tmp
+allowed_tools: [Read]
+---
+
+
+`,
+			check: errContains("empty prompt"),
+		},
+		{
+			desc: "non-mcp glob rejected",
+			content: `---
+schedule: "* * * * *"
+workdir: /tmp
+allowed_tools: [Read, "Write*"]
+---
+body
+`,
+			check: errContains("glob"),
+		},
+		{
+			desc: "mcp glob preserved verbatim",
+			content: `---
+schedule: "* * * * *"
+workdir: /tmp
+allowed_tools: [Read, "mcp__github__*"]
+---
+body
+`,
+			check: func(t *testing.T, j Job, err error) {
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				if j.AllowedTools[1] != "mcp__github__*" {
+					t.Fatalf("expected verbatim glob, got %q", j.AllowedTools[1])
+				}
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.desc, func(t *testing.T) {
+			dir := t.TempDir()
+			writeJob(t, dir, "job.md", tc.content)
+			jobs, parseErrors, err := LoadJobs(dir)
+			if err != nil {
+				t.Fatalf("top-level error: %v", err)
+			}
+			var job Job
+			var perr error
+			if len(jobs) > 0 {
+				job = jobs[0]
+			}
+			if len(parseErrors) > 0 {
+				perr = parseErrors[0].Err
+			}
+			tc.check(t, job, perr)
+		})
+	}
+}
+
+func TestLoadJobs_MixedValidInvalid(t *testing.T) {
+	dir := t.TempDir()
+	writeJob(t, dir, "a.md", `---
+schedule: "* * * * *"
+workdir: /tmp
+allowed_tools: [Read]
+---
+a
+`)
+	writeJob(t, dir, "b.md", `---
+schedule: "0 9 * * *"
+workdir: /tmp
+allowed_tools: [Write]
+---
+b
+`)
+	writeJob(t, dir, "broken.md", `---
+schedule: "* * * * *"
+---
+no workdir
+`)
+	// A non-md file should be ignored.
+	writeJob(t, dir, "ignored.txt", "not a job")
+
+	jobs, parseErrors, err := LoadJobs(dir)
+	if err != nil {
+		t.Fatalf("top-level error: %v", err)
+	}
+	if len(jobs) != 2 {
+		t.Fatalf("expected 2 valid jobs, got %d", len(jobs))
+	}
+	if len(parseErrors) != 1 {
+		t.Fatalf("expected 1 parse error, got %d", len(parseErrors))
+	}
+	if parseErrors[0].File != "broken.md" {
+		t.Fatalf("expected broken.md, got %s", parseErrors[0].File)
+	}
+}
+
+func TestLoadJobs_UnreadableDir(t *testing.T) {
+	_, _, err := LoadJobs(filepath.Join(t.TempDir(), "does-not-exist"))
+	if err == nil {
+		t.Fatal("expected top-level error for missing dir")
+	}
+}
+
+func TestLoadJobs_NameFromFilename(t *testing.T) {
+	dir := t.TempDir()
+	writeJob(t, dir, "daily-summary.md", `---
+schedule: "0 9 * * *"
+workdir: /tmp
+allowed_tools: [Read]
+---
+body
+`)
+	jobs, _, err := LoadJobs(dir)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if len(jobs) != 1 || jobs[0].Name != "daily-summary" {
+		t.Fatalf("expected name daily-summary, got %+v", jobs)
+	}
+}
+
+// errContains returns a check func that asserts exactly one parse error was
+// returned and that its message contains the given substring.
+func errContains(substr string) func(t *testing.T, j Job, err error) {
+	return func(t *testing.T, _ Job, err error) {
+		if err == nil {
+			t.Fatal("expected parse error, got nil")
+		}
+		if !strings.Contains(err.Error(), substr) {
+			t.Fatalf("error %q does not contain %q", err.Error(), substr)
+		}
+	}
+}

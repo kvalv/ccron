@@ -13,9 +13,9 @@ import (
 	"github.com/urfave/cli/v3"
 )
 
-func defaultConfigPath() string {
+func defaultJobsDir() string {
 	home, _ := os.UserHomeDir()
-	return filepath.Join(home, ".claude", "cron", "config.yaml")
+	return filepath.Join(home, ".claude", "cron", "jobs")
 }
 
 func defaultLogDir() string {
@@ -29,15 +29,15 @@ func main() {
 		Usage: "Cron scheduler for Claude Code prompts",
 		Flags: []cli.Flag{
 			&cli.StringFlag{
-				Name:    "config",
-				Aliases: []string{"c"},
-				Value:   defaultConfigPath(),
-				Usage:   "path to config file",
+				Name:    "jobs-dir",
+				Aliases: []string{"j"},
+				Value:   defaultJobsDir(),
+				Usage:   "directory containing job *.md files",
 			},
 			&cli.StringFlag{
 				Name:  "log-dir",
 				Value: defaultLogDir(),
-				Usage: "directory for task logs",
+				Usage: "directory for job logs",
 			},
 		},
 		Commands: []*cli.Command{
@@ -53,13 +53,13 @@ func main() {
 	}
 }
 
-func loadFromCtx(ctx context.Context, cmd *cli.Command) (Config, *Runner, error) {
-	cfg, err := LoadConfig(cmd.String("config"))
+func loadFromCtx(_ context.Context, cmd *cli.Command) ([]Job, []JobError, *Runner, error) {
+	jobs, parseErrors, err := LoadJobs(cmd.String("jobs-dir"))
 	if err != nil {
-		return Config{}, nil, err
+		return nil, nil, nil, err
 	}
 	runner := NewRunner(cmd.String("log-dir"))
-	return cfg, runner, nil
+	return jobs, parseErrors, runner, nil
 }
 
 func cmdStart() *cli.Command {
@@ -67,28 +67,31 @@ func cmdStart() *cli.Command {
 		Name:  "start",
 		Usage: "Start the cron scheduler daemon",
 		Action: func(ctx context.Context, cmd *cli.Command) error {
-			cfg, runner, err := loadFromCtx(ctx, cmd)
+			jobs, parseErrors, runner, err := loadFromCtx(ctx, cmd)
 			if err != nil {
 				return err
 			}
+			for _, pe := range parseErrors {
+				log.Printf("parse error in %s: %v", pe.File, pe.Err)
+			}
 
-			configPath := cmd.String("config")
-			sched := NewScheduler(runner, configPath)
-			for _, task := range cfg.Tasks {
-				log.Printf("scheduling %q: %s", task.Name, task.Schedule)
-				if err := sched.Add(task); err != nil {
-					return fmt.Errorf("add task %q: %w", task.Name, err)
+			jobsDir := cmd.String("jobs-dir")
+			sched := NewScheduler(runner, jobsDir)
+			for _, job := range jobs {
+				log.Printf("scheduling %q: %s", job.Name, job.Schedule)
+				if err := sched.Add(job); err != nil {
+					return fmt.Errorf("add job %q: %w", job.Name, err)
 				}
 			}
 
 			sched.Start()
-			log.Printf("scheduler running with %d tasks", len(cfg.Tasks))
+			log.Printf("scheduler running with %d jobs", len(jobs))
 
 			sigCh := make(chan os.Signal, 1)
 			signal.Notify(sigCh, os.Interrupt, syscall.SIGHUP)
 			for sig := range sigCh {
 				if sig == syscall.SIGHUP {
-					log.Println("SIGHUP received, reloading config...")
+					log.Println("SIGHUP received, reloading jobs...")
 					if err := sched.Reload(); err != nil {
 						log.Printf("reload failed: %v", err)
 					}
@@ -107,25 +110,25 @@ func cmdStart() *cli.Command {
 func cmdExec() *cli.Command {
 	return &cli.Command{
 		Name:      "exec",
-		Usage:     "Run a task immediately",
-		ArgsUsage: "<task-name>",
+		Usage:     "Run a job immediately",
+		ArgsUsage: "<job-name>",
 		Action: func(ctx context.Context, cmd *cli.Command) error {
 			if cmd.NArg() == 0 {
-				return fmt.Errorf("task name required")
+				return fmt.Errorf("job name required")
 			}
-			cfg, runner, err := loadFromCtx(ctx, cmd)
+			jobs, _, runner, err := loadFromCtx(ctx, cmd)
 			if err != nil {
 				return err
 			}
 
 			name := cmd.Args().First()
-			task, ok := cfg.FindTask(name)
+			job, ok := FindJob(jobs, name)
 			if !ok {
-				return fmt.Errorf("task %q not found in config", name)
+				return fmt.Errorf("job %q not found", name)
 			}
 
-			log.Printf("running task %q...", name)
-			return runner.Run(task)
+			log.Printf("running job %q...", name)
+			return runner.Run(job)
 		},
 	}
 }
@@ -133,24 +136,24 @@ func cmdExec() *cli.Command {
 func cmdList() *cli.Command {
 	return &cli.Command{
 		Name:  "list",
-		Usage: "List configured tasks",
+		Usage: "List configured jobs",
 		Action: func(ctx context.Context, cmd *cli.Command) error {
-			cfg, runner, err := loadFromCtx(ctx, cmd)
+			jobs, _, runner, err := loadFromCtx(ctx, cmd)
 			if err != nil {
 				return err
 			}
 
 			w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
 			fmt.Fprintln(w, "NAME\tSCHEDULE\tWORKDIR\tLAST RUN")
-			for _, task := range cfg.Tasks {
+			for _, job := range jobs {
 				lastRun := "-"
-				if path, err := runner.LatestLog(task.Name); err == nil {
+				if path, err := runner.LatestLog(job.Name); err == nil {
 					info, _ := os.Stat(path)
 					if info != nil {
 						lastRun = info.ModTime().Format("2006-01-02 15:04")
 					}
 				}
-				fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", task.Name, task.Schedule, task.Workdir, lastRun)
+				fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", job.Name, job.Schedule, job.Workdir, lastRun)
 			}
 			return w.Flush()
 		},
@@ -160,8 +163,8 @@ func cmdList() *cli.Command {
 func cmdLogs() *cli.Command {
 	return &cli.Command{
 		Name:      "logs",
-		Usage:     "Show logs for a task (latest run by default)",
-		ArgsUsage: "<task-name>",
+		Usage:     "Show logs for a job (latest run by default)",
+		ArgsUsage: "<job-name>",
 		Flags: []cli.Flag{
 			&cli.IntFlag{
 				Name:    "tail",
@@ -176,9 +179,9 @@ func cmdLogs() *cli.Command {
 		},
 		Action: func(ctx context.Context, cmd *cli.Command) error {
 			if cmd.NArg() == 0 {
-				return fmt.Errorf("task name required")
+				return fmt.Errorf("job name required")
 			}
-			_, runner, err := loadFromCtx(ctx, cmd)
+			_, _, runner, err := loadFromCtx(ctx, cmd)
 			if err != nil {
 				return err
 			}
@@ -186,21 +189,15 @@ func cmdLogs() *cli.Command {
 			name := cmd.Args().First()
 			n := int(cmd.Int("tail"))
 
+			logs, err := runner.ListLogs(name, n)
+			if err != nil {
+				return err
+			}
 			if cmd.Bool("list") {
-				logs, err := runner.ListLogs(name, n)
-				if err != nil {
-					return err
-				}
 				for _, l := range logs {
 					fmt.Println(l)
 				}
 				return nil
-			}
-
-			// Show content of latest log(s)
-			logs, err := runner.ListLogs(name, n)
-			if err != nil {
-				return err
 			}
 			for _, l := range logs {
 				if n > 1 {

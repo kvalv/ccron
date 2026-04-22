@@ -8,49 +8,51 @@ import (
 )
 
 type Scheduler struct {
-	cron       *cron.Cron
-	runner     *Runner
-	configPath string
+	cron    *cron.Cron
+	runner  *Runner
+	jobsDir string
 }
 
-func NewScheduler(runner *Runner, configPath string) *Scheduler {
+func NewScheduler(runner *Runner, jobsDir string) *Scheduler {
 	return &Scheduler{
-		cron:       cron.New(),
-		runner:     runner,
-		configPath: configPath,
+		cron:    cron.New(),
+		runner:  runner,
+		jobsDir: jobsDir,
 	}
 }
 
-func (s *Scheduler) Add(task Task) error {
-	t := task
-	_, err := s.cron.AddFunc(t.Schedule, func() {
-		log.Printf("running scheduled task %q", t.Name)
-		if err := s.runner.Run(t); err != nil {
-			log.Printf("task %q error: %v", t.Name, err)
+func (s *Scheduler) Add(job Job) error {
+	j := job
+	_, err := s.cron.AddFunc(j.Schedule, func() {
+		log.Printf("running scheduled job %q", j.Name)
+		if err := s.runner.Run(j); err != nil {
+			log.Printf("job %q error: %v", j.Name, err)
 		}
 	})
 	return err
 }
 
 func (s *Scheduler) Reload() error {
-	cfg, err := LoadConfig(s.configPath)
+	jobs, parseErrors, err := LoadJobs(s.jobsDir)
 	if err != nil {
-		return fmt.Errorf("reload config: %w", err)
+		return fmt.Errorf("reload jobs: %w", err)
+	}
+	for _, pe := range parseErrors {
+		log.Printf("parse error in %s: %v", pe.File, pe.Err)
 	}
 
-	// Stop old cron, create new one
 	s.cron.Stop()
 	s.cron = cron.New()
 
-	for _, task := range cfg.Tasks {
-		log.Printf("scheduling %q: %s", task.Name, task.Schedule)
-		if err := s.Add(task); err != nil {
-			return fmt.Errorf("add task %q: %w", task.Name, err)
+	for _, job := range jobs {
+		log.Printf("scheduling %q: %s", job.Name, job.Schedule)
+		if err := s.Add(job); err != nil {
+			return fmt.Errorf("add job %q: %w", job.Name, err)
 		}
 	}
 
 	s.cron.Start()
-	log.Printf("reloaded: %d tasks", len(cfg.Tasks))
+	log.Printf("reloaded: %d jobs", len(jobs))
 	return nil
 }
 

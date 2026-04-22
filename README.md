@@ -1,10 +1,16 @@
-# ccron: Claude Code + Cron scheduler
+# ccron
 
 A cron-like scheduler for running Claude Code prompts. Useful for automating recurring AI tasks like daily summaries, periodic checks or scheduled reports.
 
 Each job is a Markdown file with the prompt. Configuration, such as the cron schedule, working directory, allowed tools and memory access are defined in a YAML frontmatter at the top of the file.
 
-This is essentially `claude -p "..."` mixed with `cron`.
+Compared to Anthropic's [scheduled tasks](https://code.claude.com/docs/en/scheduled-tasks), which only fire while a Claude Code session is open:
+
+- `ccron` runs detached as a systemd daemon; no session required.
+- Jobs are specified as markdown files, not in chat.
+- Jobs can opt into memory that persists between runs.
+
+When Anthropic ships local jobs that are not dependent on sessions, this program is probably not needed anymore.
 
 ## Example
 
@@ -37,8 +43,6 @@ The preamble is YAML between `---` fences. The body (everything after the closin
 
 `allowed_tools` entries are passed to `--allowedTools`. Glob patterns with `*` are supported for MCP tools (e.g. `mcp__github__*` allows every tool exposed by the `github` MCP server).
 
-`enabled_if` is an optional shell expression evaluated with `sh -c` on every scheduled tick, with the job's `workdir` as cwd. Exit 0 runs the job, any non-zero exit silently skips it. This is intended for jobs whose files are synced across machines (Syncthing, dotfiles repos, etc.) where you want a host/user gate. `ccron exec <job>` bypasses this check — it's a manual override.
-
 ## Usage
 
 ```bash
@@ -52,11 +56,13 @@ ccron logs --job <job> -n 5    # last 5 runs of a specific job
 
 Running `ccron` with no arguments prints a status table. If any job file fails to parse, it's reported there too - no need to start the daemon to find out.
 
-Everything lives under `--base-dir` (default `~/.claude/cron`): your `*.md` job files sit at the top, and ccron manages `logs/`, `state/`, `memory/` subdirs beneath. Point `--base-dir` elsewhere to sandbox experiments — `ccron --base-dir /tmp/play exec foo` leaves your real config untouched.
+Use `--base-dir` to specify the root directory for jobs (default `~/.claude/cron`).
 
 If a job is still running when its next schedule fires, that run is skipped (one job runs at a time per job name).
 
 Cron expressions evaluate in the system's local timezone.
+
+`enabled_if` is an optional shell expression evaluated with `sh -c` on every scheduled tick, with the job's `workdir` as cwd. Exit 0 runs the job, any non-zero exit silently skips it. This is intended for jobs whose files are synced across machines (Syncthing, dotfiles repos, etc.) where you want a host/user gate. `ccron exec <job>` bypasses this check; it's a manual override.
 
 ## Run as a systemd user service
 
@@ -105,7 +111,7 @@ memory_initial_records: 10 # optional. N most-recent log records primed into the
 
 When enabled, two things happen on every run:
 
-1. **Prompt includes previous memory**: A summary and the N last log records are prepended to the prompt in a `## Prior memory` block.
+1. **Prompt includes previous memory**: A summary and the `memory_initial_records` last log records are prepended to the prompt in a `## Prior memory` block.
 2. **MCP server to access memory**: The agent has access to read and write the memory via MCP.
 
 ## Logs

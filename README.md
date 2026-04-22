@@ -1,17 +1,17 @@
-# ccron
+# ccron: Claude Code + Cron scheduler
 
 A cron-like scheduler for running Claude Code prompts. Useful for automating recurring AI tasks like daily summaries, periodic checks or scheduled reports.
 
-Each job is a Markdown file with the prompt. A frontmatter in the Markdown contains the cron schedule, working directory, allowed tools, and other settings.
+Each job is a Markdown file with the prompt. Configuration, such as the cron schedule, working directory, allowed tools and memory access are defined in a YAML frontmatter at the top of the file.
 
 This is essentially `claude -p "..."` mixed with `cron`.
 
 ## Example
 
 ```
-~/.claude/cron/jobs/
-├── daily-summary.md
-└── weekly-check.md
+~/.claude/cron/
+├── daily-summary.md    # job 1
+└── weekly-check.md     # job 2
 ```
 
 `daily-summary.md`:
@@ -52,6 +52,8 @@ ccron logs --job <job> -n 5    # last 5 runs of a specific job
 
 Running `ccron` with no arguments prints a status table. If any job file fails to parse, it's reported there too - no need to start the daemon to find out.
 
+Everything lives under `--base-dir` (default `~/.claude/cron`): your `*.md` job files sit at the top, and ccron manages `logs/`, `state/`, `memory/` subdirs beneath. Point `--base-dir` elsewhere to sandbox experiments — `ccron --base-dir /tmp/play exec foo` leaves your real config untouched.
+
 If a job is still running when its next schedule fires, that run is skipped (one job runs at a time per job name).
 
 Cron expressions evaluate in the system's local timezone.
@@ -82,10 +84,29 @@ Then:
 ```bash
 systemctl --user daemon-reload
 systemctl --user enable --now ccron
-systemctl --user reload ccron   # reload jobs (SIGHUP)
 ```
 
 If `claude` isn't on the default `PATH` (e.g. it's in `~/.claude/local/`, installed via nvm, etc.), prepend that directory to the `Environment=PATH=...` line so the child process can find it.
+
+## Memory (per-job)
+
+Jobs can opt in to a small, persistent memory that carries facts forward between runs. Off by default.
+
+```yaml
+---
+schedule: "0 9 * * *"
+workdir: ~/projects
+allowed_tools: [Read, Write]
+
+memory: 100 # cap on log records (FIFO eviction). 0 or absent = disabled.
+memory_initial_records: 10 # optional. N most-recent log records primed into the prompt. Default 10.
+---
+```
+
+When enabled, two things happen on every run:
+
+1. **Prompt includes previous memory**: A summary and the N last log records are prepended to the prompt in a `## Prior memory` block.
+2. **MCP server to access memory**: The agent has access to read and write the memory via MCP.
 
 ## Logs
 

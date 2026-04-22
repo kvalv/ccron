@@ -21,8 +21,7 @@ func writeJobFile(t *testing.T, dir, name, schedule, prompt string) {
 
 func newTestScheduler(t *testing.T, jobsDir string) *Scheduler {
 	t.Helper()
-	base := t.TempDir()
-	runner := NewRunner(filepath.Join(base, "logs"))
+	runner := NewRunner(t.TempDir())
 	return NewScheduler(t.Context(), runner, jobsDir)
 }
 

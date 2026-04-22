@@ -28,9 +28,7 @@ func installFakeClaude(t *testing.T, script string) {
 
 func newTestRunner(t *testing.T) *Runner {
 	t.Helper()
-	base := t.TempDir()
-	logDir := filepath.Join(base, "logs")
-	return NewRunner(logDir)
+	return NewRunner(t.TempDir())
 }
 
 func testJob(name string) Job {
@@ -284,6 +282,286 @@ exit 0`, argsFile)
 	// Non-matching MCP tool (different server) must not be expanded in.
 	if strings.Contains(argv, "mcp__slack__") {
 		t.Fatalf("unexpected non-matching tool in argv:\n%s", argv)
+	}
+}
+
+// memoryEnabledJob returns a testJob with memory enabled, sharing the runner's
+// memory dir layout. The store for it lives at <r.MemoryDir>/<name>.
+func memoryEnabledJob(name string, cap, initial int) Job {
+	j := testJob(name)
+	j.Memory = &MemoryConfig{MaxRecords: cap, InitialRecords: initial}
+	return j
+}
+
+// installFakeClaudeCapture writes a fake `claude` that dumps the full argv to
+// argsFile (one arg per line) AND the second positional arg (the -p prompt) to
+// promptFile, since prompts may contain newlines and would otherwise be
+// indistinguishable from argv separators.
+func installFakeClaudeCapture(t *testing.T, argsFile, promptFile string) {
+	t.Helper()
+	script := fmt.Sprintf(`printf '%%s\n' "$@" > %q
+# claude is invoked as: claude -p <prompt> ...
+if [ "$1" = "-p" ]; then
+  printf '%%s' "$2" > %q
+fi
+exit 0`, argsFile, promptFile)
+	installFakeClaude(t, script)
+}
+
+func TestRunner_MemoryPriming_Seeded(t *testing.T) {
+	tmp := t.TempDir()
+	argsFile := filepath.Join(tmp, "args.txt")
+	promptFile := filepath.Join(tmp, "prompt.txt")
+	installFakeClaudeCapture(t, argsFile, promptFile)
+
+	r := newTestRunner(t)
+	job := memoryEnabledJob("primed-job", 100, 10)
+	job.Prompt = "ORIGINAL BODY"
+
+	// Seed the memory dir for this job.
+	store := r.memoryStore(job)
+	if err := store.SummaryWrite("the digest"); err != nil {
+		t.Fatalf("SummaryWrite: %v", err)
+	}
+	for _, c := range []string{"alpha-entry", "beta-entry", "gamma-entry"} {
+		if _, err := store.LogWrite(c); err != nil {
+			t.Fatalf("LogWrite(%s): %v", c, err)
+		}
+	}
+
+	if err := r.Run(t.Context(), job); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	pdata, err := os.ReadFile(promptFile)
+	if err != nil {
+		t.Fatalf("read prompt: %v", err)
+	}
+	prompt := string(pdata)
+
+	for _, want := range []string{
+		"## Prior memory",
+		"### Summary",
+		"the digest",
+		"### Recent log (most recent first)",
+		"alpha-entry",
+		"beta-entry",
+		"gamma-entry",
+		"---",
+		"ORIGINAL BODY",
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Errorf("prompt missing %q:\n%s", want, prompt)
+		}
+	}
+
+	// gamma-entry is newest; should appear before alpha-entry in newest-first ordering.
+	if strings.Index(prompt, "gamma-entry") >= strings.Index(prompt, "alpha-entry") {
+		t.Errorf("expected newest-first log ordering (gamma before alpha):\n%s", prompt)
+	}
+	// Prime block must come before original body.
+	if strings.Index(prompt, "## Prior memory") > strings.Index(prompt, "ORIGINAL BODY") {
+		t.Errorf("prime block should precede body:\n%s", prompt)
+	}
+}
+
+func TestRunner_MemoryPriming_EmptyStore(t *testing.T) {
+	tmp := t.TempDir()
+	argsFile := filepath.Join(tmp, "args.txt")
+	promptFile := filepath.Join(tmp, "prompt.txt")
+	installFakeClaudeCapture(t, argsFile, promptFile)
+
+	r := newTestRunner(t)
+	job := memoryEnabledJob("empty-mem-job", 100, 10)
+	job.Prompt = "ORIGINAL BODY"
+
+	if err := r.Run(t.Context(), job); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	pdata, err := os.ReadFile(promptFile)
+	if err != nil {
+		t.Fatalf("read prompt: %v", err)
+	}
+	prompt := string(pdata)
+	if strings.Contains(prompt, "## Prior memory") {
+		t.Fatalf("empty store should produce no prime block:\n%s", prompt)
+	}
+	if prompt != "ORIGINAL BODY" {
+		t.Fatalf("expected prompt unchanged, got: %q", prompt)
+	}
+}
+
+func TestRunner_MemoryPriming_OnlySummary(t *testing.T) {
+	tmp := t.TempDir()
+	argsFile := filepath.Join(tmp, "args.txt")
+	promptFile := filepath.Join(tmp, "prompt.txt")
+	installFakeClaudeCapture(t, argsFile, promptFile)
+
+	r := newTestRunner(t)
+	job := memoryEnabledJob("summary-only-job", 100, 10)
+	job.Prompt = "BODY"
+
+	store := r.memoryStore(job)
+	if err := store.SummaryWrite("just a summary"); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := r.Run(t.Context(), job); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	pdata, err := os.ReadFile(promptFile)
+	if err != nil {
+		t.Fatalf("read prompt: %v", err)
+	}
+	prompt := string(pdata)
+	if !strings.Contains(prompt, "### Summary") {
+		t.Errorf("missing summary section:\n%s", prompt)
+	}
+	if strings.Contains(prompt, "### Recent log") {
+		t.Errorf("unexpected log section when log empty:\n%s", prompt)
+	}
+}
+
+func TestRunner_MemoryDisabled_NoPriming(t *testing.T) {
+	tmp := t.TempDir()
+	argsFile := filepath.Join(tmp, "args.txt")
+	promptFile := filepath.Join(tmp, "prompt.txt")
+	installFakeClaudeCapture(t, argsFile, promptFile)
+
+	r := newTestRunner(t)
+	job := testJob("nomem-job") // Memory == nil
+	job.Prompt = "BODY"
+
+	// Even if a memory dir exists for this job name, it must be ignored when
+	// Memory is nil on the Job.
+	store := &Store{Dir: filepath.Join(r.MemoryDir, job.Name), Cap: 10}
+	if err := store.SummaryWrite("should be ignored"); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := r.Run(t.Context(), job); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	pdata, err := os.ReadFile(promptFile)
+	if err != nil {
+		t.Fatalf("read prompt: %v", err)
+	}
+	prompt := string(pdata)
+	if strings.Contains(prompt, "## Prior memory") || strings.Contains(prompt, "should be ignored") {
+		t.Fatalf("memory disabled should not prime:\n%s", prompt)
+	}
+}
+
+func TestRunner_MemoryMCP_ArgvAndConfig(t *testing.T) {
+	tmp := t.TempDir()
+	argsFile := filepath.Join(tmp, "args.txt")
+	promptFile := filepath.Join(tmp, "prompt.txt")
+	cfgSnapshot := filepath.Join(tmp, "mcp-config-snapshot.json")
+	// Fake claude snapshots the --mcp-config file into cfgSnapshot while still
+	// running, since the runner removes the original on return. $7 is the
+	// --mcp-config path: argv is -p <prompt> --output-format text --allowedTools <list> --mcp-config <path>.
+	installFakeClaude(t, fmt.Sprintf(`
+printf '%%s\n' "$@" > %q
+if [ "$1" = "-p" ]; then
+  printf '%%s' "$2" > %q
+fi
+# Find --mcp-config and snapshot the file it points at.
+prev=""
+for arg in "$@"; do
+  if [ "$prev" = "--mcp-config" ]; then
+    cp "$arg" %q
+    break
+  fi
+  prev="$arg"
+done
+exit 0`, argsFile, promptFile, cfgSnapshot))
+
+	r := newTestRunner(t)
+	job := memoryEnabledJob("mcp-job", 50, 5)
+	job.Prompt = "BODY"
+	if err := r.Run(t.Context(), job); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	argv, err := os.ReadFile(argsFile)
+	if err != nil {
+		t.Fatalf("read args: %v", err)
+	}
+	a := string(argv)
+
+	// All four memory tool names appear in --allowedTools.
+	for _, name := range memoryMCPToolNames {
+		if !strings.Contains(a, name) {
+			t.Errorf("argv missing memory tool %q:\n%s", name, a)
+		}
+	}
+
+	// --mcp-config must be present.
+	if !strings.Contains(a, "--mcp-config") {
+		t.Fatalf("argv missing --mcp-config:\n%s", a)
+	}
+
+	// The snapshot captures the config file's contents during the run.
+	cfgData, err := os.ReadFile(cfgSnapshot)
+	if err != nil {
+		t.Fatalf("mcp-config snapshot missing: %v", err)
+	}
+	var cfg mcpConfig
+	if err := json.Unmarshal(cfgData, &cfg); err != nil {
+		t.Fatalf("mcp-config not valid JSON: %v\n%s", err, cfgData)
+	}
+	srv, ok := cfg.MCPServers[memoryMCPServerName]
+	if !ok {
+		t.Fatalf("mcp-config missing %s server: %s", memoryMCPServerName, cfgData)
+	}
+	if srv.Command == "" {
+		t.Errorf("mcp-config server has empty command: %+v", srv)
+	}
+	// Args should include memory-mcp + --job mcp-job + --memory-dir + --max-records 50.
+	joined := strings.Join(srv.Args, " ")
+	for _, want := range []string{"memory-mcp", "--job", "mcp-job", "--memory-dir", "--max-records", "50"} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("mcp-config args missing %q: %v", want, srv.Args)
+		}
+	}
+
+	// And — the critical new invariant — the original config is removed after
+	// the run returns.
+	lines := strings.Split(a, "\n")
+	var cfgPath string
+	for i, l := range lines {
+		if l == "--mcp-config" && i+1 < len(lines) {
+			cfgPath = lines[i+1]
+			break
+		}
+	}
+	if cfgPath == "" {
+		t.Fatalf("could not extract --mcp-config path from argv:\n%s", a)
+	}
+	if _, err := os.Stat(cfgPath); !os.IsNotExist(err) {
+		t.Fatalf("mcp-config should be removed after run, stat err: %v", err)
+	}
+}
+
+func TestRunner_MemoryDisabled_NoMCPArgs(t *testing.T) {
+	tmp := t.TempDir()
+	argsFile := filepath.Join(tmp, "args.txt")
+	promptFile := filepath.Join(tmp, "prompt.txt")
+	installFakeClaudeCapture(t, argsFile, promptFile)
+
+	r := newTestRunner(t)
+	job := testJob("plain-job") // memory disabled
+	if err := r.Run(t.Context(), job); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	argv, _ := os.ReadFile(argsFile)
+	a := string(argv)
+	if strings.Contains(a, "--mcp-config") {
+		t.Errorf("argv should not have --mcp-config when memory disabled:\n%s", a)
+	}
+	for _, name := range memoryMCPToolNames {
+		if strings.Contains(a, name) {
+			t.Errorf("argv should not contain memory tool %q when memory disabled:\n%s", name, a)
+		}
 	}
 }
 

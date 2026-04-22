@@ -24,6 +24,7 @@ type Job struct {
 	Timeout      time.Duration
 	EnabledIf    string
 	Prompt       string
+	Memory       *MemoryConfig
 }
 
 type JobError struct {
@@ -36,13 +37,17 @@ func (e JobError) Error() string {
 }
 
 type frontmatter struct {
-	Schedule     string   `yaml:"schedule"`
-	Workdir      string   `yaml:"workdir"`
-	AllowedTools []string `yaml:"allowed_tools"`
-	Description  string   `yaml:"description"`
-	Timeout      string   `yaml:"timeout"`
-	EnabledIf    string   `yaml:"enabled_if"`
+	Schedule             string   `yaml:"schedule"`
+	Workdir              string   `yaml:"workdir"`
+	AllowedTools         []string `yaml:"allowed_tools"`
+	Description          string   `yaml:"description"`
+	Timeout              string   `yaml:"timeout"`
+	EnabledIf            string   `yaml:"enabled_if"`
+	Memory               int      `yaml:"memory"`
+	MemoryInitialRecords *int     `yaml:"memory_initial_records"`
 }
+
+const defaultMemoryInitialRecords = 10
 
 // LoadJobs walks dir non-recursively, parsing each *.md file. Per-file parse
 // errors are collected into parseErrors; they do not fail the whole load. A
@@ -119,6 +124,28 @@ func parseJobFile(path string) (Job, error) {
 		timeout = d
 	}
 
+	var mem *MemoryConfig
+	if front.Memory < 0 {
+		return Job{}, fmt.Errorf("memory must be >= 0, got %d", front.Memory)
+	}
+	if front.Memory > 0 {
+		initial := defaultMemoryInitialRecords
+		if front.MemoryInitialRecords != nil {
+			initial = *front.MemoryInitialRecords
+			if initial < 0 {
+				return Job{}, fmt.Errorf("memory_initial_records must be >= 0, got %d", initial)
+			}
+			if initial > front.Memory {
+				return Job{}, fmt.Errorf("memory_initial_records (%d) must be <= memory (%d)", initial, front.Memory)
+			}
+		} else if initial > front.Memory {
+			initial = front.Memory
+		}
+		mem = &MemoryConfig{MaxRecords: front.Memory, InitialRecords: initial}
+	} else if front.MemoryInitialRecords != nil {
+		return Job{}, fmt.Errorf("memory_initial_records set but memory disabled (memory: 0)")
+	}
+
 	return Job{
 		Name:         name,
 		Schedule:     front.Schedule,
@@ -128,6 +155,7 @@ func parseJobFile(path string) (Job, error) {
 		Timeout:      timeout,
 		EnabledIf:    front.EnabledIf,
 		Prompt:       prompt,
+		Memory:       mem,
 	}, nil
 }
 

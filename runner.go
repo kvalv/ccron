@@ -18,14 +18,19 @@ import (
 )
 
 type Runner struct {
-	LogDir   string
-	StateDir string
+	LogDir    string
+	StateDir  string
+	MemoryDir string
 }
 
-func NewRunner(logDir string) *Runner {
-	// ~/.claude/cron/state sits alongside ~/.claude/cron/logs.
-	stateDir := filepath.Join(filepath.Dir(logDir), "state")
-	return &Runner{LogDir: logDir, StateDir: stateDir}
+// NewRunner derives the runtime subdirs (logs/, state/, memory/) under base.
+// Job *.md files live at the top of base itself.
+func NewRunner(base string) *Runner {
+	return &Runner{
+		LogDir:    filepath.Join(base, "logs"),
+		StateDir:  filepath.Join(base, "state"),
+		MemoryDir: filepath.Join(base, "memory"),
+	}
 }
 
 // RunState is written to disk after each run so `ccron` status (without a
@@ -55,6 +60,37 @@ func (r *Runner) Run(ctx context.Context, job Job) error {
 	logger := log.New(logFile, "", log.LstdFlags)
 	logger.Printf("starting job %q", job.Name)
 	logger.Printf("workdir: %s", job.Workdir)
+
+	var mcpConfigPath string
+	if job.Memory != nil {
+		store := r.memoryStore(job)
+		primeBlock, err := buildPrimeBlock(store, job.Memory.InitialRecords)
+		if err != nil {
+			logger.Printf("memory prime failed (continuing without): %v", err)
+		} else if primeBlock != "" {
+			job.Prompt = primeBlock + job.Prompt
+		}
+
+		selfExe, err := os.Executable()
+		if err != nil {
+			logger.Printf("os.Executable: %v", err)
+			return r.finishRun(job, time.Now(), time.Now(), -1, fmt.Errorf("os.Executable: %w", err))
+		}
+		mcpConfigPath = filepath.Join(jobDir, ts+".mcp-config.json")
+		if err := writeMemoryMCPConfig(mcpConfigPath, selfExe, job.Name, store.Dir, job.Memory.MaxRecords); err != nil {
+			logger.Printf("write mcp-config: %v", err)
+			return r.finishRun(job, time.Now(), time.Now(), -1, fmt.Errorf("write mcp-config: %w", err))
+		}
+		defer func() {
+			if err := os.Remove(mcpConfigPath); err != nil && !os.IsNotExist(err) {
+				logger.Printf("remove mcp-config: %v", err)
+			}
+		}()
+		// Inject the four memory tool names into allowed_tools. They have no
+		// `*` so expandAllowedTools passes them through verbatim.
+		job.AllowedTools = append(append([]string{}, job.AllowedTools...), memoryMCPToolNames...)
+	}
+
 	logger.Printf("prompt: %s", job.Prompt)
 
 	runCtx := ctx
@@ -71,6 +107,9 @@ func (r *Runner) Run(ctx context.Context, job Job) error {
 	}
 
 	args := job.ClaudeArgs(allowedTools)
+	if mcpConfigPath != "" {
+		args = append(args, "--mcp-config", mcpConfigPath)
+	}
 	cmd := exec.CommandContext(runCtx, "claude", args...)
 	cmd.Dir = job.Workdir
 	cmd.Stdout = io.MultiWriter(logFile, os.Stdout)
@@ -298,6 +337,54 @@ func (r *Runner) ListLogs(jobName string, limit int) ([]string, error) {
 		paths = append(paths, filepath.Join(jobDir, e.Name()))
 	}
 	return paths, nil
+}
+
+// memoryStore returns the Store for a job's memory directory. Caller is
+// responsible for checking job.Memory != nil first.
+func (r *Runner) memoryStore(job Job) *Store {
+	return &Store{
+		Dir: filepath.Join(r.MemoryDir, job.Name),
+		Cap: job.Memory.MaxRecords,
+	}
+}
+
+// buildPrimeBlock returns the "## Prior memory" block to prepend to the prompt
+// body. Empty string when both summary.md and log.jsonl have no content.
+func buildPrimeBlock(store *Store, initialLogRecords int) (string, error) {
+	summary, err := store.SummaryView()
+	if err != nil {
+		return "", fmt.Errorf("read summary: %w", err)
+	}
+	var recs []Record
+	if initialLogRecords > 0 {
+		recs, err = store.LogList(initialLogRecords, 0)
+		if err != nil {
+			return "", fmt.Errorf("read log: %w", err)
+		}
+	}
+	if strings.TrimSpace(summary) == "" && len(recs) == 0 {
+		return "", nil
+	}
+	var b strings.Builder
+	b.WriteString("## Prior memory\n\n")
+	if strings.TrimSpace(summary) != "" {
+		b.WriteString("### Summary\n")
+		b.WriteString(summary)
+		if !strings.HasSuffix(summary, "\n") {
+			b.WriteString("\n")
+		}
+		b.WriteString("\n")
+	}
+	if len(recs) > 0 {
+		b.WriteString("### Recent log (most recent first)\n")
+		for _, rec := range recs {
+			ts := rec.CreatedAt.Format("2006-01-02 15:04")
+			b.WriteString(fmt.Sprintf("- %s: %s\n", ts, rec.Content))
+		}
+		b.WriteString("\n")
+	}
+	b.WriteString("---\n\n")
+	return b.String(), nil
 }
 
 // ListAllLogs returns log file paths across every job, sorted by modtime

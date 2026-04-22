@@ -203,7 +203,8 @@ func jobHash(j Job) string {
 		Timeout      time.Duration
 		EnabledIf    string
 		Prompt       string
-	}{j.Schedule, j.Workdir, j.AllowedTools, j.Timeout, j.EnabledIf, j.Prompt})
+		Memory       *MemoryConfig
+	}{j.Schedule, j.Workdir, j.AllowedTools, j.Timeout, j.EnabledIf, j.Prompt, j.Memory})
 	sum := sha256.Sum256(payload)
 	return hex.EncodeToString(sum[:])
 }

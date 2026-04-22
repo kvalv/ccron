@@ -200,6 +200,145 @@ body
 				}
 			},
 		},
+		{
+			desc: "memory disabled by default",
+			content: `---
+schedule: "* * * * *"
+workdir: /tmp
+allowed_tools: [Read]
+---
+body
+`,
+			check: func(t *testing.T, j Job, err error) {
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				if j.Memory != nil {
+					t.Fatalf("expected nil Memory, got %+v", j.Memory)
+				}
+			},
+		},
+		{
+			desc: "memory enabled with default initial",
+			content: `---
+schedule: "* * * * *"
+workdir: /tmp
+allowed_tools: [Read]
+memory: 50
+---
+body
+`,
+			check: func(t *testing.T, j Job, err error) {
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				if j.Memory == nil {
+					t.Fatal("expected Memory != nil")
+				}
+				if j.Memory.MaxRecords != 50 {
+					t.Errorf("MaxRecords = %d, want 50", j.Memory.MaxRecords)
+				}
+				if j.Memory.InitialRecords != 10 {
+					t.Errorf("InitialRecords = %d, want 10 (default)", j.Memory.InitialRecords)
+				}
+			},
+		},
+		{
+			desc: "memory enabled with explicit initial",
+			content: `---
+schedule: "* * * * *"
+workdir: /tmp
+allowed_tools: [Read]
+memory: 100
+memory_initial_records: 25
+---
+body
+`,
+			check: func(t *testing.T, j Job, err error) {
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				if j.Memory == nil || j.Memory.MaxRecords != 100 || j.Memory.InitialRecords != 25 {
+					t.Fatalf("bad memory: %+v", j.Memory)
+				}
+			},
+		},
+		{
+			desc: "memory_initial_records 0 is allowed",
+			content: `---
+schedule: "* * * * *"
+workdir: /tmp
+allowed_tools: [Read]
+memory: 50
+memory_initial_records: 0
+---
+body
+`,
+			check: func(t *testing.T, j Job, err error) {
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				if j.Memory == nil || j.Memory.InitialRecords != 0 {
+					t.Fatalf("bad memory: %+v", j.Memory)
+				}
+			},
+		},
+		{
+			desc: "memory cap smaller than default initial caps initial",
+			content: `---
+schedule: "* * * * *"
+workdir: /tmp
+allowed_tools: [Read]
+memory: 3
+---
+body
+`,
+			check: func(t *testing.T, j Job, err error) {
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				if j.Memory == nil || j.Memory.InitialRecords != 3 {
+					t.Fatalf("expected initial capped to 3, got %+v", j.Memory)
+				}
+			},
+		},
+		{
+			desc: "memory negative rejected",
+			content: `---
+schedule: "* * * * *"
+workdir: /tmp
+allowed_tools: [Read]
+memory: -1
+---
+body
+`,
+			check: errContains("memory must be >= 0"),
+		},
+		{
+			desc: "memory_initial_records exceeds memory rejected",
+			content: `---
+schedule: "* * * * *"
+workdir: /tmp
+allowed_tools: [Read]
+memory: 5
+memory_initial_records: 10
+---
+body
+`,
+			check: errContains("must be <="),
+		},
+		{
+			desc: "memory_initial_records without memory rejected",
+			content: `---
+schedule: "* * * * *"
+workdir: /tmp
+allowed_tools: [Read]
+memory_initial_records: 5
+---
+body
+`,
+			check: errContains("memory disabled"),
+		},
 	}
 
 	for _, tc := range cases {

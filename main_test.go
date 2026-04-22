@@ -9,9 +9,9 @@ import (
 )
 
 // runCmd runs the top-level CLI against args (starting after the program
-// name) with --jobs-dir pointed at jobsDir. Stdout and stderr are redirected
+// name) with --base-dir pointed at baseDir. Stdout and stderr are redirected
 // into the returned strings for inspection.
-func runCmd(t *testing.T, jobsDir string, args ...string) (stdout, stderr string, err error) {
+func runCmd(t *testing.T, baseDir string, args ...string) (stdout, stderr string, err error) {
 	t.Helper()
 	// Redirect stdout/stderr through pipes.
 	oldOut, oldErr := os.Stdout, os.Stderr
@@ -49,7 +49,7 @@ func runCmd(t *testing.T, jobsDir string, args ...string) (stdout, stderr string
 	}()
 
 	app := buildApp()
-	full := append([]string{"ccron", "--jobs-dir", jobsDir, "--log-dir", filepath.Join(t.TempDir(), "logs")}, args...)
+	full := append([]string{"ccron", "--base-dir", baseDir}, args...)
 	err = app.Run(context.Background(), full)
 
 	outW.Close()
@@ -93,6 +93,32 @@ func TestCmdValidate_MixedFailsNonZero(t *testing.T) {
 		if !strings.Contains(stderr, want) {
 			t.Errorf("stderr missing %q:\n%s", want, stderr)
 		}
+	}
+}
+
+// TestCmdBaseDir_IgnoresRuntimeSubdirs: *.md files sit directly in base, and
+// ccron-managed subdirs (logs/, state/, memory/) must not be scanned for jobs.
+// Exercise via validate (which only needs jobs).
+func TestCmdBaseDir_IgnoresRuntimeSubdirs(t *testing.T) {
+	base := t.TempDir()
+	writeJobFile(t, base, "real", "* * * * *", "ok")
+	// Plant a malformed .md inside a runtime subdir — must be skipped, not reported.
+	for _, sub := range []string{"logs", "state", "memory"} {
+		dir := filepath.Join(base, sub)
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "fake.md"), []byte("not a job"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	stdout, _, err := runCmd(t, base, "validate")
+	if err != nil {
+		t.Fatalf("validate: %v", err)
+	}
+	if !strings.Contains(stdout, "1 valid, 0 invalid") {
+		t.Fatalf("should find exactly one job at top of base; got: %q", stdout)
 	}
 }
 

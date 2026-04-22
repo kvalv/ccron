@@ -13,18 +13,14 @@ import (
 	"text/tabwriter"
 	"time"
 
+	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/robfig/cron/v3"
 	"github.com/urfave/cli/v3"
 )
 
-func defaultJobsDir() string {
+func defaultBaseDir() string {
 	home, _ := os.UserHomeDir()
-	return filepath.Join(home, ".claude", "cron", "jobs")
-}
-
-func defaultLogDir() string {
-	home, _ := os.UserHomeDir()
-	return filepath.Join(home, ".claude", "cron", "logs")
+	return filepath.Join(home, ".claude", "cron")
 }
 
 func buildApp() *cli.Command {
@@ -33,15 +29,10 @@ func buildApp() *cli.Command {
 		Usage: "Cron scheduler for Claude Code prompts",
 		Flags: []cli.Flag{
 			&cli.StringFlag{
-				Name:    "jobs-dir",
-				Aliases: []string{"j"},
-				Value:   defaultJobsDir(),
-				Usage:   "directory containing job *.md files",
-			},
-			&cli.StringFlag{
-				Name:  "log-dir",
-				Value: defaultLogDir(),
-				Usage: "directory for job logs",
+				Name:    "base-dir",
+				Aliases: []string{"b"},
+				Value:   defaultBaseDir(),
+				Usage:   "base directory: holds *.md job files; ccron manages logs/, state/, memory/ subdirs",
 			},
 			&cli.IntFlag{
 				Name:  "log-retention-days",
@@ -55,6 +46,7 @@ func buildApp() *cli.Command {
 			cmdExec(),
 			cmdValidate(),
 			cmdLogs(),
+			cmdMemoryMCP(),
 		},
 	}
 }
@@ -66,11 +58,12 @@ func main() {
 }
 
 func loadFromCtx(_ context.Context, cmd *cli.Command) ([]Job, []JobError, *Runner, error) {
-	jobs, parseErrors, err := LoadJobs(cmd.String("jobs-dir"))
+	base := cmd.String("base-dir")
+	jobs, parseErrors, err := LoadJobs(base)
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	runner := NewRunner(cmd.String("log-dir"))
+	runner := NewRunner(base)
 	return jobs, parseErrors, runner, nil
 }
 
@@ -130,8 +123,7 @@ func cmdStart() *cli.Command {
 				log.Printf("parse error in %s: %v", pe.File, pe.Err)
 			}
 
-			jobsDir := cmd.String("jobs-dir")
-			sched := NewScheduler(ctx, runner, jobsDir)
+			sched := NewScheduler(ctx, runner, cmd.String("base-dir"))
 			if err := sched.Reload(); err != nil {
 				return err
 			}
@@ -221,6 +213,29 @@ func cmdValidate() *cli.Command {
 				return fmt.Errorf("validation failed for %d file(s)", len(parseErrors))
 			}
 			return nil
+		},
+	}
+}
+
+// cmdMemoryMCP is the hidden subcommand spawned by the runner as a stdio MCP
+// server for a single job's memory store. Not user-facing; exposed only so
+// `claude --mcp-config <ours>` can launch it.
+func cmdMemoryMCP() *cli.Command {
+	return &cli.Command{
+		Name:   "memory-mcp",
+		Hidden: true,
+		Flags: []cli.Flag{
+			&cli.StringFlag{Name: "job", Required: true},
+			&cli.StringFlag{Name: "memory-dir", Required: true},
+			&cli.IntFlag{Name: "max-records", Required: true},
+		},
+		Action: func(ctx context.Context, cmd *cli.Command) error {
+			store := &Store{
+				Dir: cmd.String("memory-dir"),
+				Cap: int(cmd.Int("max-records")),
+			}
+			server := buildMemoryMCPServer(store)
+			return server.Run(ctx, &mcp.StdioTransport{})
 		},
 	}
 }

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -112,7 +113,7 @@ func TestRenderEvents(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.desc, func(t *testing.T) {
 			var buf strings.Builder
-			if err := renderEventsAt(strings.NewReader(tc.in+"\n"), &buf, now); err != nil {
+			if err := renderEventsAt(strings.NewReader(tc.in+"\n"), &buf, now, palette{}); err != nil {
 				t.Fatalf("RenderEvents: %v", err)
 			}
 			got := buf.String()
@@ -146,7 +147,7 @@ func TestRenderEvents_realSampleLog(t *testing.T) {
 `
 	fixed := time.Date(2026, 4, 23, 13, 29, 30, 0, time.UTC)
 	var buf strings.Builder
-	if err := renderEventsAt(strings.NewReader(sample), &buf, func() time.Time { return fixed }); err != nil {
+	if err := renderEventsAt(strings.NewReader(sample), &buf, func() time.Time { return fixed }, palette{}); err != nil {
 		t.Fatalf("RenderEvents: %v", err)
 	}
 	got := buf.String()
@@ -180,4 +181,100 @@ func TestRenderEvents_realSampleLog(t *testing.T) {
 	if strings.Contains(got, "🧠") {
 		t.Errorf("empty thinking block leaked into output:\n%s", got)
 	}
+}
+
+// TestRenderEvents_colored verifies that ANSI escape codes are embedded in
+// the rendered output when the ansi palette is in use. We don't assert
+// exact byte-for-byte layout (fragile) — just that the right colors appear
+// attached to the right markers: cyan on ●, green on ✓ (tool result),
+// red on ✗ (tool_result with is_error), yellow on ⚠ (rate limit), and a
+// bold green `✓ done` on a successful result.
+func TestRenderEvents_colored(t *testing.T) {
+	fixed := time.Date(2026, 4, 23, 13, 29, 30, 0, time.UTC)
+	now := func() time.Time { return fixed }
+
+	cases := []struct {
+		desc string
+		in   string
+		want []string
+	}{
+		{
+			desc: "session init marker is cyan",
+			in:   `{"type":"system","subtype":"init","session_id":"abc","model":"m","permissionMode":"default"}`,
+			want: []string{ansi.cyan + "●" + ansi.reset},
+		},
+		{
+			desc: "successful tool result has green check",
+			in:   `{"type":"user","message":{"content":[{"type":"tool_result","content":"ok"}]}}`,
+			want: []string{ansi.green + "✓" + ansi.reset, "ok"},
+		},
+		{
+			desc: "errored tool result has red cross",
+			in:   `{"type":"user","message":{"content":[{"type":"tool_result","content":"boom","is_error":true}]}}`,
+			want: []string{ansi.red + "✗" + ansi.reset, "boom"},
+		},
+		{
+			desc: "rate limit warning is yellow",
+			in:   `{"type":"rate_limit_event","rate_limit_info":{"status":"throttled"}}`,
+			want: []string{ansi.yellow + "⚠ rate limit: throttled" + ansi.reset},
+		},
+		{
+			desc: "success result is bold green",
+			in:   `{"type":"result","duration_ms":1000,"num_turns":1,"total_cost_usd":0.01}`,
+			want: []string{ansi.green + ansi.bold + "✓" + ansi.reset, "done in 1.0s"},
+		},
+		{
+			desc: "error result is bold red",
+			in:   `{"type":"result","is_error":true,"duration_ms":500,"num_turns":1}`,
+			want: []string{ansi.red + ansi.bold + "✗" + ansi.reset},
+		},
+		{
+			desc: "timestamp is wrapped in gray",
+			in:   `{"type":"result","duration_ms":1,"num_turns":1}`,
+			want: []string{ansi.gray + "13:29:30" + ansi.reset},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.desc, func(t *testing.T) {
+			var buf strings.Builder
+			if err := renderEventsAt(strings.NewReader(tc.in+"\n"), &buf, now, ansi); err != nil {
+				t.Fatalf("renderEventsAt: %v", err)
+			}
+			got := buf.String()
+			for _, needle := range tc.want {
+				if !strings.Contains(got, needle) {
+					t.Errorf("missing %q in colored output:\n%q", needle, got)
+				}
+			}
+		})
+	}
+}
+
+func TestPickPalette(t *testing.T) {
+	t.Run("NO_COLOR disables even for TTY-ish writers", func(t *testing.T) {
+		t.Setenv("NO_COLOR", "1")
+		// os.Stdout may or may not be a TTY in `go test` — doesn't matter,
+		// NO_COLOR overrides.
+		if got := pickPalette(os.Stdout); got != (palette{}) {
+			t.Errorf("expected zero palette with NO_COLOR set, got %+v", got)
+		}
+	})
+	t.Run("non-file writer gets no color", func(t *testing.T) {
+		t.Setenv("NO_COLOR", "")
+		var buf strings.Builder
+		if got := pickPalette(&buf); got != (palette{}) {
+			t.Errorf("expected zero palette for non-File writer, got %+v", got)
+		}
+	})
+	t.Run("pipe writer gets no color", func(t *testing.T) {
+		t.Setenv("NO_COLOR", "")
+		_, w, err := os.Pipe()
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer w.Close()
+		if got := pickPalette(w); got != (palette{}) {
+			t.Errorf("expected zero palette for pipe writer, got %+v", got)
+		}
+	})
 }

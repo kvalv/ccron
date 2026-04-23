@@ -5,8 +5,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"os"
 	"strings"
 	"time"
+
+	"golang.org/x/term"
 )
 
 // RenderEvents reads newline-delimited claude stream-json events from r and
@@ -14,14 +17,18 @@ import (
 // (they might be partial JSON while the process is still writing, or the
 // non-JSON "starting job ..." preamble the runner emits).
 //
+// Colors are emitted automatically when w is a terminal and NO_COLOR is not
+// set (https://no-color.org/). Piping into a file or another process drops
+// to plain ASCII so logs and jq pipelines stay clean.
+//
 // Returns nil on normal EOF. Any write error aborts.
 func RenderEvents(r io.Reader, w io.Writer) error {
-	return renderEventsAt(r, w, time.Now)
+	return renderEventsAt(r, w, time.Now, pickPalette(w))
 }
 
-// renderEventsAt is the testable core — accepts an injectable clock so tests
-// can assert deterministic timestamps.
-func renderEventsAt(r io.Reader, w io.Writer, now func() time.Time) error {
+// renderEventsAt is the testable core — accepts an injectable clock and an
+// explicit palette so tests can assert both plain and colored output.
+func renderEventsAt(r io.Reader, w io.Writer, now func() time.Time, p palette) error {
 	sc := bufio.NewScanner(r)
 	// Default Scanner buffer (64 KiB) is too small for init events that
 	// enumerate every tool name. 4 MiB is plenty.
@@ -35,7 +42,7 @@ func renderEventsAt(r io.Reader, w io.Writer, now func() time.Time) error {
 		if err := json.Unmarshal(line, &ev); err != nil {
 			continue
 		}
-		out := renderEvent(ev, now())
+		out := renderEvent(ev, now(), p)
 		if out == "" {
 			continue
 		}
@@ -87,8 +94,8 @@ type contentBlock struct {
 	IsError   bool            `json:"is_error,omitempty"`
 }
 
-func renderEvent(ev envelope, t time.Time) string {
-	ts := t.Format("15:04:05")
+func renderEvent(ev envelope, t time.Time, p palette) string {
+	ts := p.gray + t.Format("15:04:05") + p.reset
 	switch ev.Type {
 	case "system":
 		if ev.Subtype != "init" {
@@ -102,33 +109,36 @@ func renderEvent(ev envelope, t time.Time) string {
 		if mode == "" {
 			mode = "default"
 		}
-		return fmt.Sprintf("%s ● session %s · %s · permission=%s", ts, sid, ev.Model, mode)
+		return fmt.Sprintf("%s %s●%s session %s · %s · permission=%s",
+			ts, p.cyan, p.reset, sid, ev.Model, mode)
 
 	case "rate_limit_event":
 		if ev.RateLimitInfo == nil || ev.RateLimitInfo.Status == "allowed" {
 			return ""
 		}
-		return fmt.Sprintf("%s ⚠ rate limit: %s", ts, ev.RateLimitInfo.Status)
+		return fmt.Sprintf("%s %s⚠ rate limit: %s%s",
+			ts, p.yellow, ev.RateLimitInfo.Status, p.reset)
 
 	case "assistant":
-		return renderAssistant(ev.Message, ts)
+		return renderAssistant(ev.Message, ts, p)
 
 	case "user":
-		return renderUser(ev.Message, ts)
+		return renderUser(ev.Message, ts, p)
 
 	case "result":
-		mark := "✓"
+		mark, color := "✓", p.green
 		if ev.IsError {
-			mark = "✗"
+			mark, color = "✗", p.red
 		}
 		dur := time.Duration(ev.DurationMs) * time.Millisecond
-		return fmt.Sprintf("%s %s done in %s · %d turns · $%.2f",
-			ts, mark, formatDuration(dur), ev.NumTurns, ev.TotalCostUSD)
+		return fmt.Sprintf("%s %s%s%s done in %s · %d turns · $%.2f",
+			ts, color+p.bold, mark, p.reset,
+			formatDuration(dur), ev.NumTurns, ev.TotalCostUSD)
 	}
 	return ""
 }
 
-func renderAssistant(raw json.RawMessage, ts string) string {
+func renderAssistant(raw json.RawMessage, ts string, p palette) string {
 	var m msgBody
 	if err := json.Unmarshal(raw, &m); err != nil {
 		return ""
@@ -141,10 +151,13 @@ func renderAssistant(raw json.RawMessage, ts string) string {
 			if strings.TrimSpace(b.Thinking) == "" {
 				continue
 			}
-			lines = append(lines, fmt.Sprintf("%s 🧠 %s", ts, truncOneLine(b.Thinking, 120)))
+			lines = append(lines, fmt.Sprintf("%s %s🧠 %s%s",
+				ts, p.dim, truncOneLine(b.Thinking, 120), p.reset))
 		case "tool_use":
-			lines = append(lines, fmt.Sprintf("%s ▶ %s   %s",
-				ts, padRight(b.Name, 6), truncOneLine(toolSummary(b.Name, b.Input), 120)))
+			lines = append(lines, fmt.Sprintf("%s %s▶%s %s%s%s   %s",
+				ts, p.blue, p.reset,
+				p.cyan, padRight(b.Name, 6), p.reset,
+				truncOneLine(toolSummary(b.Name, b.Input), 120)))
 		case "text":
 			if strings.TrimSpace(b.Text) == "" {
 				continue
@@ -155,7 +168,7 @@ func renderAssistant(raw json.RawMessage, ts string) string {
 	return strings.Join(lines, "\n")
 }
 
-func renderUser(raw json.RawMessage, ts string) string {
+func renderUser(raw json.RawMessage, ts string, p palette) string {
 	var m msgBody
 	if err := json.Unmarshal(raw, &m); err != nil {
 		return ""
@@ -165,12 +178,13 @@ func renderUser(raw json.RawMessage, ts string) string {
 		if b.Type != "tool_result" {
 			continue
 		}
-		mark := "✓"
+		mark, color := "✓", p.green
 		if b.IsError {
-			mark = "✗"
+			mark, color = "✗", p.red
 		}
 		body := toolResultText(b.Content)
-		lines = append(lines, fmt.Sprintf("%s   %s %s", ts, mark, truncOneLine(body, 160)))
+		lines = append(lines, fmt.Sprintf("%s   %s%s%s %s",
+			ts, color, mark, p.reset, truncOneLine(body, 160)))
 	}
 	return strings.Join(lines, "\n")
 }
@@ -280,4 +294,45 @@ func formatDuration(d time.Duration) string {
 		return fmt.Sprintf("%.1fs", d.Seconds())
 	}
 	return fmt.Sprintf("%dm%02ds", int(d.Minutes()), int(d.Seconds())%60)
+}
+
+// palette holds ANSI escape codes used by the renderer. A zero-value palette
+// has empty strings for every field, producing plain ASCII output. The
+// `ansi` palette has the real codes; pickPalette picks between them based on
+// the output destination.
+type palette struct {
+	reset, dim, bold   string
+	red, green, yellow string
+	blue, cyan, gray   string
+}
+
+var ansi = palette{
+	reset:  "\x1b[0m",
+	dim:    "\x1b[2m",
+	bold:   "\x1b[1m",
+	red:    "\x1b[31m",
+	green:  "\x1b[32m",
+	yellow: "\x1b[33m",
+	blue:   "\x1b[34m",
+	cyan:   "\x1b[36m",
+	gray:   "\x1b[90m",
+}
+
+// pickPalette returns the ansi palette when w is a terminal and NO_COLOR
+// is not set; otherwise a zero palette that renders plain ASCII. The check
+// only recognises *os.File writers — other writer shapes (io.Pipe, buffer,
+// etc.) are assumed non-terminal and get no color. That matches how
+// callers currently hook up the renderer.
+func pickPalette(w io.Writer) palette {
+	if os.Getenv("NO_COLOR") != "" {
+		return palette{}
+	}
+	f, ok := w.(*os.File)
+	if !ok {
+		return palette{}
+	}
+	if !term.IsTerminal(int(f.Fd())) {
+		return palette{}
+	}
+	return ansi
 }

@@ -18,14 +18,16 @@ var followPollInterval = 500 * time.Millisecond
 
 // followLogs implements `ccron logs --follow`. It finds the most recent log
 // file — either for a specific job or across all jobs — seeks to its end,
-// then prints newly appended lines as they arrive. When a newer log file
-// appears (a new run has started), it switches to that file so long-lived
-// `--follow` sessions don't get stuck on a completed run.
+// then writes newly appended lines to out as they arrive. When a newer log
+// file appears (a new run started), it switches automatically so long-lived
+// sessions stay useful across runs.
 //
-// Output is raw NDJSON (no pretty-printing). Pipe to jq or the renderer
-// yourself if you want it formatted. Returns nil when ctx is cancelled
-// (e.g. Ctrl-C), otherwise an I/O error.
-func followLogs(ctx context.Context, runner *Runner, jobFilter string) error {
+// out receives raw log content. The CLI wraps this through the ccron
+// renderer so the terminal sees pretty output; --raw bypasses the wrap for
+// jq-style piping.
+//
+// Returns nil when ctx is cancelled (e.g. Ctrl-C), otherwise an I/O error.
+func followLogs(ctx context.Context, runner *Runner, jobFilter string, out io.Writer) error {
 	current, err := pickLatestLog(runner, jobFilter)
 	if err != nil {
 		// No logs yet — wait for the first one to appear rather than
@@ -38,11 +40,9 @@ func followLogs(ctx context.Context, runner *Runner, jobFilter string) error {
 	}
 
 	for {
-		if err := followSingle(ctx, runner, jobFilter, current); err != nil {
+		if err := followSingle(ctx, runner, jobFilter, current, out); err != nil {
 			return err
 		}
-		// followSingle returns when a newer log file exists for this filter.
-		// Re-pick and continue — picks up whichever file is now newest.
 		next, err := pickLatestLog(runner, jobFilter)
 		if err != nil {
 			return err
@@ -54,17 +54,18 @@ func followLogs(ctx context.Context, runner *Runner, jobFilter string) error {
 			return nil
 		}
 		current = next
-		// Blank line separator between runs so the transition is visible in
-		// the terminal. NDJSON consumers (jq) tolerate blank lines.
-		fmt.Println()
+		// Blank line separator between runs so the transition is visible.
+		// NDJSON consumers tolerate blank lines; the renderer drops lines
+		// that don't start with '{'.
+		_, _ = fmt.Fprintln(out)
 	}
 }
 
-// followSingle streams appended content from `path` until one of:
+// followSingle streams appended content from path to out until one of:
 //   - ctx is cancelled (returns nil)
 //   - a newer log file appears for the filter (returns nil; caller switches)
 //   - an I/O error occurs (returns that error)
-func followSingle(ctx context.Context, runner *Runner, jobFilter, path string) error {
+func followSingle(ctx context.Context, runner *Runner, jobFilter, path string, out io.Writer) error {
 	f, err := os.Open(path)
 	if err != nil {
 		return fmt.Errorf("open log: %w", err)
@@ -79,7 +80,7 @@ func followSingle(ctx context.Context, runner *Runner, jobFilter, path string) e
 	for {
 		line, err := reader.ReadString('\n')
 		if line != "" {
-			if _, werr := fmt.Print(line); werr != nil {
+			if _, werr := fmt.Fprint(out, line); werr != nil {
 				return werr
 			}
 		}
@@ -89,8 +90,6 @@ func followSingle(ctx context.Context, runner *Runner, jobFilter, path string) e
 		if !errors.Is(err, io.EOF) {
 			return fmt.Errorf("read log: %w", err)
 		}
-		// At EOF: check for a newer log file (new run started), else
-		// wait and retry. Use a select so ctx cancellation is prompt.
 		select {
 		case <-ctx.Done():
 			return nil

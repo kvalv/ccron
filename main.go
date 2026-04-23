@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/signal"
@@ -258,7 +259,11 @@ func cmdLogs() *cli.Command {
 			&cli.BoolFlag{
 				Name:    "follow",
 				Aliases: []string{"f"},
-				Usage:   "follow the latest log as lines are written (raw output); switches to newer runs as they start. Ignores --tail",
+				Usage:   "follow the latest log as lines are written; switches to newer runs as they start. Ignores --tail",
+			},
+			&cli.BoolFlag{
+				Name:  "raw",
+				Usage: "emit raw stream-json (no pretty rendering). Useful for piping to jq",
 			},
 		},
 		Action: func(ctx context.Context, cmd *cli.Command) error {
@@ -268,8 +273,17 @@ func cmdLogs() *cli.Command {
 			}
 
 			jobFilter := cmd.String("job")
+			raw := cmd.Bool("raw")
+
+			// Wrap stdout through the renderer unless --raw is set. The
+			// renderer reads NDJSON line-by-line and flushes a formatted
+			// line per event; non-JSON lines (the ccron log preamble)
+			// are dropped silently.
+			out, flush := wrapRender(os.Stdout, raw)
+			defer flush()
+
 			if cmd.Bool("follow") {
-				return followLogs(ctx, runner, jobFilter)
+				return followLogs(ctx, runner, jobFilter, out)
 			}
 
 			n := int(cmd.Int("tail"))
@@ -287,21 +301,52 @@ func cmdLogs() *cli.Command {
 			for _, l := range logs {
 				// Header (job/filename) when printing more than one file so
 				// the reader can tell runs apart — especially when they're
-				// from different jobs.
+				// from different jobs. Headers go straight to stdout so
+				// they remain visible even in pretty mode (the renderer
+				// would drop them).
 				if len(logs) > 1 {
 					rel, relErr := filepath.Rel(runner.LogDir, l)
 					if relErr != nil {
 						rel = filepath.Base(l)
 					}
+					// Flush any pending rendered output before the header.
+					flush()
+					out, flush = wrapRender(os.Stdout, raw)
 					fmt.Printf("=== %s ===\n", rel)
 				}
-				data, err := os.ReadFile(l)
+				f, err := os.Open(l)
 				if err != nil {
 					return err
 				}
-				fmt.Print(string(data))
+				if _, err := io.Copy(out, f); err != nil {
+					f.Close()
+					return err
+				}
+				f.Close()
 			}
 			return nil
 		},
+	}
+}
+
+// wrapRender returns an io.Writer that callers feed raw log content into.
+// When raw is true it's just the passthrough writer and flush is a no-op.
+// When raw is false it sets up an io.Pipe + RenderEvents goroutine so every
+// line written is parsed as a stream-json event and a formatted summary is
+// emitted to dst. flush() must be called once to close the pipe and wait
+// for the renderer to drain before returning to the caller.
+func wrapRender(dst io.Writer, raw bool) (out io.Writer, flush func()) {
+	if raw {
+		return dst, func() {}
+	}
+	pr, pw := io.Pipe()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = RenderEvents(pr, dst)
+	}()
+	return pw, func() {
+		_ = pw.Close()
+		<-done
 	}
 }

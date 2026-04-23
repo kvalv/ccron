@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
@@ -13,6 +14,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -252,28 +254,109 @@ func expandAllowedTools(ctx context.Context, tools []string) ([]string, error) {
 	return out, nil
 }
 
-var mcpToolPattern = regexp.MustCompile(`mcp__[A-Za-z0-9_-]+__[A-Za-z0-9_-]+`)
+var (
+	mcpToolsCacheMu  sync.Mutex
+	mcpToolsCache    []string
+	mcpToolsCacheAt  time.Time
+	mcpToolsCacheTTL = 6 * time.Hour
+)
 
-// listMCPTools runs `claude mcp list` and extracts every mcp__<server>__<tool>
-// token from its output. This is resilient to the command's exact format
-// (plain-text table or JSON) as long as tool names appear verbatim somewhere.
+// listMCPTools returns the list of mcp__<server>__<tool> names available to
+// claude in this environment.
+//
+// We can't derive this from `claude mcp list` — that command only prints
+// server names, not tool names. Instead we briefly spawn `claude -p` with
+// stream-json output, read the `system/init` event (always the first line,
+// emitted before any API call is made), pluck out the `tools` array, and
+// kill the process. No tokens are billed as long as we kill before the
+// model is invoked.
+//
+// Result is cached per-process for mcpToolsCacheTTL to amortize the ~1–3s
+// startup cost across job runs.
 func listMCPTools(ctx context.Context) ([]string, error) {
-	cmd := exec.CommandContext(ctx, "claude", "mcp", "list")
-	out, err := cmd.Output()
-	if err != nil {
-		return nil, fmt.Errorf("claude mcp list: %w", err)
+	mcpToolsCacheMu.Lock()
+	if mcpToolsCache != nil && time.Since(mcpToolsCacheAt) < mcpToolsCacheTTL {
+		cached := append([]string(nil), mcpToolsCache...)
+		mcpToolsCacheMu.Unlock()
+		return cached, nil
 	}
-	matches := mcpToolPattern.FindAllString(string(out), -1)
-	seen := map[string]struct{}{}
-	var tools []string
-	for _, m := range matches {
-		if _, ok := seen[m]; ok {
+	mcpToolsCacheMu.Unlock()
+
+	tools, err := probeMCPTools(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	mcpToolsCacheMu.Lock()
+	mcpToolsCache = append([]string(nil), tools...)
+	mcpToolsCacheAt = time.Now()
+	mcpToolsCacheMu.Unlock()
+	return tools, nil
+}
+
+// probeMCPTools does one uncached probe.
+func probeMCPTools(ctx context.Context) ([]string, error) {
+	probeCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(probeCtx, "claude",
+		"-p", "ok",
+		"--output-format", "stream-json",
+		"--verbose",
+		"--max-turns", "1",
+	)
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return nil, fmt.Errorf("stdout pipe: %w", err)
+	}
+	cmd.Stderr = io.Discard
+	// Own process group so we kill MCP subprocess trees on defer.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+
+	if err := cmd.Start(); err != nil {
+		return nil, fmt.Errorf("start claude probe: %w", err)
+	}
+	defer func() {
+		if cmd.Process != nil {
+			_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		}
+		_ = cmd.Wait()
+	}()
+
+	return parseMCPToolsFromInit(stdout)
+}
+
+// parseMCPToolsFromInit reads stream-json lines from r, finds the
+// `system/init` event, and returns the subset of its `tools` array that are
+// MCP tools (prefixed `mcp__`). Exported shape separately so tests can feed
+// it fixture NDJSON without spawning claude.
+func parseMCPToolsFromInit(r io.Reader) ([]string, error) {
+	sc := bufio.NewScanner(r)
+	sc.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
+	for sc.Scan() {
+		var ev struct {
+			Type    string   `json:"type"`
+			Subtype string   `json:"subtype"`
+			Tools   []string `json:"tools"`
+		}
+		if err := json.Unmarshal(sc.Bytes(), &ev); err != nil {
 			continue
 		}
-		seen[m] = struct{}{}
-		tools = append(tools, m)
+		if ev.Type != "system" || ev.Subtype != "init" {
+			continue
+		}
+		var out []string
+		for _, t := range ev.Tools {
+			if strings.HasPrefix(t, "mcp__") {
+				out = append(out, t)
+			}
+		}
+		return out, nil
 	}
-	return tools, nil
+	if err := sc.Err(); err != nil {
+		return nil, fmt.Errorf("read probe stdout: %w", err)
+	}
+	return nil, fmt.Errorf("no system/init event received from claude probe")
 }
 
 // globMatch reports whether pattern matches s, treating `*` as "zero or more

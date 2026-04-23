@@ -239,20 +239,33 @@ func TestRunner_AllowedToolsPassedThrough(t *testing.T) {
 	}
 }
 
-// TestRunner_MCPGlobExpansion: fake claude, when invoked as `claude mcp
-// list`, prints a known tool list; otherwise echoes its args. Registering a
-// job with `mcp__github__*` in allowed_tools should cause the expanded tool
-// names (not the literal glob) to land in the --allowedTools argv.
+// TestRunner_MCPGlobExpansion: a fake `claude` on PATH emits a stream-json
+// `system/init` event listing available tools (that's how ccron discovers
+// MCP tools now — the old `claude mcp list` output stopped including tool
+// names). When the same binary is invoked for the real job run, it dumps
+// argv to a file so the test can assert the glob was expanded before
+// --allowedTools reached claude.
 func TestRunner_MCPGlobExpansion(t *testing.T) {
+	resetMCPToolsCache()
+	t.Cleanup(resetMCPToolsCache)
+
 	argsFile := filepath.Join(t.TempDir(), "args.txt")
+	// The probe invocation carries --max-turns 1; the real run does not.
+	// In probe mode we emit init then hang so the probe's SIGKILL closes
+	// us out. In run mode we emit init (so the renderer has something
+	// valid to parse) then dump argv and exit clean.
 	script := fmt.Sprintf(`
-if [ "$1" = "mcp" ] && [ "$2" = "list" ]; then
-  cat <<EOF
-mcp__github__list_prs
-mcp__github__get_issue
-mcp__slack__send_message
-EOF
-  exit 0
+is_probe=0
+for a in "$@"; do
+  if [ "$a" = "--max-turns" ]; then
+    is_probe=1
+    break
+  fi
+done
+printf '%%s\n' '{"type":"system","subtype":"init","session_id":"fake","model":"fake","permissionMode":"default","tools":["Bash","Read","mcp__github__list_prs","mcp__github__get_issue","mcp__slack__send_message"]}'
+if [ "$is_probe" = "1" ]; then
+  # Hold stdout open until the probe kills us.
+  sleep 30
 fi
 printf '%%s\n' "$@" > %q
 exit 0`, argsFile)
@@ -585,4 +598,158 @@ func TestGlobMatch(t *testing.T) {
 			}
 		})
 	}
+}
+
+// resetMCPToolsCache clears the process-level cache so tests don't leak
+// state into each other. Register via t.Cleanup in tests that depend on
+// a fresh probe.
+func resetMCPToolsCache() {
+	mcpToolsCacheMu.Lock()
+	mcpToolsCache = nil
+	mcpToolsCacheAt = time.Time{}
+	mcpToolsCacheMu.Unlock()
+}
+
+func TestParseMCPToolsFromInit(t *testing.T) {
+	cases := []struct {
+		desc string
+		in   string
+		want []string
+	}{
+		{
+			desc: "init event with mix of built-in and mcp tools",
+			in: `{"type":"system","subtype":"init","tools":[` +
+				`"Bash","Read","mcp__claude_ai_Linear__list_issues",` +
+				`"mcp__plugin_playwright_playwright__browser_click","Edit"]}`,
+			want: []string{
+				"mcp__claude_ai_Linear__list_issues",
+				"mcp__plugin_playwright_playwright__browser_click",
+			},
+		},
+		{
+			desc: "init event with no mcp tools returns nil",
+			in:   `{"type":"system","subtype":"init","tools":["Bash","Read"]}`,
+			want: nil,
+		},
+		{
+			desc: "non-init lines are skipped until init found",
+			in: `{"type":"rate_limit_event","rate_limit_info":{"status":"allowed"}}
+not json at all
+{"type":"assistant","message":{"content":[]}}
+{"type":"system","subtype":"init","tools":["mcp__foo__bar"]}`,
+			want: []string{"mcp__foo__bar"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.desc, func(t *testing.T) {
+			got, err := parseMCPToolsFromInit(strings.NewReader(tc.in))
+			if err != nil {
+				t.Fatalf("parseMCPToolsFromInit: %v", err)
+			}
+			if !equalStrings(got, tc.want) {
+				t.Fatalf("got %v, want %v", got, tc.want)
+			}
+		})
+	}
+
+	t.Run("no init event before EOF returns error", func(t *testing.T) {
+		_, err := parseMCPToolsFromInit(strings.NewReader(`{"type":"result","result":"ok"}`))
+		if err == nil {
+			t.Fatal("expected error, got nil")
+		}
+	})
+}
+
+// TestListMCPTools_withFakeClaude shells out to a fake `claude` binary on
+// PATH that emits a canned stream-json init event. This covers the probe
+// plumbing (spawn, read stdout, parse, kill) without touching the real
+// claude or network.
+func TestListMCPTools_withFakeClaude(t *testing.T) {
+	resetMCPToolsCache()
+	t.Cleanup(resetMCPToolsCache)
+
+	// Print init JSON, then sleep so the probe has to kill us. If the probe
+	// read+returned correctly, it won't wait for our exit.
+	installFakeClaude(t, `
+printf '%s\n' '{"type":"system","subtype":"init","tools":["Bash","mcp__foo__a","mcp__foo__b","Read"]}'
+sleep 30
+`)
+
+	tools, err := listMCPTools(t.Context())
+	if err != nil {
+		t.Fatalf("listMCPTools: %v", err)
+	}
+	want := []string{"mcp__foo__a", "mcp__foo__b"}
+	if !equalStrings(tools, want) {
+		t.Fatalf("got %v, want %v", tools, want)
+	}
+
+	// Second call within TTL should be cache-served and must not re-exec
+	// claude. Prove it by swapping the fake for one that would fail — the
+	// call still returns the cached tools.
+	installFakeClaude(t, `echo "this should not run" >&2; exit 1`)
+	tools2, err := listMCPTools(t.Context())
+	if err != nil {
+		t.Fatalf("cached listMCPTools: %v", err)
+	}
+	if !equalStrings(tools2, want) {
+		t.Fatalf("cached result diverged: got %v, want %v", tools2, want)
+	}
+}
+
+// TestListMCPTools_Integration runs the real claude binary to confirm that
+// the probe extracts MCP tool names from a live system/init event. Gated on
+// the INTEGRATION env var so `go test -short ./...` and CI don't invoke it.
+//
+// Requires: `claude` on PATH, authenticated, with at least one MCP server
+// that exposes tools (the test asserts ≥1 mcp__ tool is returned and, if
+// Linear is configured, ≥1 mcp__*_Linear__ tool too).
+func TestListMCPTools_Integration(t *testing.T) {
+	if os.Getenv("INTEGRATION") == "" {
+		t.Skip("set INTEGRATION=1 to run — spawns the real `claude` binary")
+	}
+	resetMCPToolsCache()
+	t.Cleanup(resetMCPToolsCache)
+
+	ctx, cancel := context.WithTimeout(t.Context(), 60*time.Second)
+	defer cancel()
+
+	tools, err := listMCPTools(ctx)
+	if err != nil {
+		t.Fatalf("listMCPTools: %v", err)
+	}
+	if len(tools) == 0 {
+		t.Fatalf("expected at least one mcp__ tool, got none — is any MCP server configured?")
+	}
+	for _, tool := range tools {
+		if !strings.HasPrefix(tool, "mcp__") {
+			t.Errorf("non-mcp tool leaked into result: %q", tool)
+		}
+	}
+	t.Logf("discovered %d MCP tools, first few: %v", len(tools), tools[:min(len(tools), 5)])
+
+	// Bonus assertion: if a Linear server is configured (common for this
+	// user), at least one list_* tool should show up.
+	var linearSeen bool
+	for _, tool := range tools {
+		if strings.Contains(tool, "_Linear__") {
+			linearSeen = true
+			break
+		}
+	}
+	if !linearSeen {
+		t.Logf("note: no Linear MCP tools found — skipping Linear-specific check")
+	}
+}
+
+func equalStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }

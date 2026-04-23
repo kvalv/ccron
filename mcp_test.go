@@ -8,12 +8,13 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
-// dialMemoryMCP wires an in-memory client to a server backed by store, returns
-// the connected client session. Caller defers session.Close().
-func dialMemoryMCP(t *testing.T, store *Store) *mcp.ClientSession {
+// dialMCP wires an in-memory client to a server backed by store, returns the
+// connected client session. store may be nil to exercise the memory-not-enabled
+// path. Caller defers session.Close().
+func dialMCP(t *testing.T, store *Store) *mcp.ClientSession {
 	t.Helper()
 	clientT, serverT := mcp.NewInMemoryTransports()
-	server := buildMemoryMCPServer(store)
+	server := buildMCPServer(store)
 	if _, err := server.Connect(t.Context(), serverT, nil); err != nil {
 		t.Fatalf("server.Connect: %v", err)
 	}
@@ -47,9 +48,33 @@ func callTool(t *testing.T, sess *mcp.ClientSession, name string, args any) stri
 	return tc.Text
 }
 
-func TestMemoryMCP_ListsFourTools(t *testing.T) {
+// callToolExpectErr calls a tool expecting either a transport error or
+// IsError=true. Returns the error message (from err or content).
+func callToolExpectErr(t *testing.T, sess *mcp.ClientSession, name string, args any) string {
+	t.Helper()
+	res, err := sess.CallTool(t.Context(), &mcp.CallToolParams{
+		Name:      name,
+		Arguments: args,
+	})
+	if err != nil {
+		return err.Error()
+	}
+	if !res.IsError {
+		t.Fatalf("expected error from %s, got ok: %+v", name, res.Content)
+	}
+	if len(res.Content) == 0 {
+		return ""
+	}
+	tc, ok := res.Content[0].(*mcp.TextContent)
+	if !ok {
+		t.Fatalf("expected TextContent, got %T", res.Content[0])
+	}
+	return tc.Text
+}
+
+func TestMCP_ListsAllTools(t *testing.T) {
 	store := newStore(t, 10)
-	sess := dialMemoryMCP(t, store)
+	sess := dialMCP(t, store)
 	defer sess.Close()
 
 	res, err := sess.ListTools(t.Context(), &mcp.ListToolsParams{})
@@ -61,6 +86,7 @@ func TestMemoryMCP_ListsFourTools(t *testing.T) {
 		got[tool.Name] = true
 	}
 	want := []string{
+		"run_summary_write",
 		"memory_summary_view",
 		"memory_summary_write",
 		"memory_log_list",
@@ -76,9 +102,45 @@ func TestMemoryMCP_ListsFourTools(t *testing.T) {
 	}
 }
 
-func TestMemoryMCP_SummaryRoundtrip(t *testing.T) {
+func TestMCP_RunSummaryWrite_ReturnsOk(t *testing.T) {
+	// Store is irrelevant for run_summary_write — it's stateless.
+	sess := dialMCP(t, nil)
+	defer sess.Close()
+
+	for _, content := range []string{"ran fine", "", strings.Repeat("x", 200)} {
+		if got := callTool(t, sess, "run_summary_write", runSummaryWriteArgs{Content: content}); got != "ok" {
+			t.Errorf("run_summary_write(%q) = %q, want %q", content, got, "ok")
+		}
+	}
+}
+
+func TestMCP_MemoryTools_NilStoreError(t *testing.T) {
+	sess := dialMCP(t, nil)
+	defer sess.Close()
+
+	cases := []struct {
+		desc string
+		name string
+		args any
+	}{
+		{"summary_view", "memory_summary_view", emptyArgs{}},
+		{"summary_write", "memory_summary_write", summaryWriteArgs{Content: "x"}},
+		{"log_list", "memory_log_list", logListArgs{}},
+		{"log_write", "memory_log_write", logWriteArgs{Content: "x"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.desc, func(t *testing.T) {
+			msg := callToolExpectErr(t, sess, tc.name, tc.args)
+			if !strings.Contains(msg, "not enabled") {
+				t.Errorf("expected %q to mention 'not enabled', got %q", tc.name, msg)
+			}
+		})
+	}
+}
+
+func TestMCP_SummaryRoundtrip(t *testing.T) {
 	store := newStore(t, 10)
-	sess := dialMemoryMCP(t, store)
+	sess := dialMCP(t, store)
 	defer sess.Close()
 
 	if got := callTool(t, sess, "memory_summary_view", emptyArgs{}); got != "" {
@@ -90,9 +152,9 @@ func TestMemoryMCP_SummaryRoundtrip(t *testing.T) {
 	}
 }
 
-func TestMemoryMCP_LogWriteAndList(t *testing.T) {
+func TestMCP_LogWriteAndList(t *testing.T) {
 	store := newStore(t, 10)
-	sess := dialMemoryMCP(t, store)
+	sess := dialMCP(t, store)
 	defer sess.Close()
 
 	for _, c := range []string{"one", "two", "three"} {
@@ -107,7 +169,6 @@ func TestMemoryMCP_LogWriteAndList(t *testing.T) {
 	if len(recs) != 3 {
 		t.Fatalf("expected 3 records, got %d", len(recs))
 	}
-	// Newest-first.
 	want := []string{"three", "two", "one"}
 	for i, w := range want {
 		if recs[i].Content != w {
@@ -115,7 +176,6 @@ func TestMemoryMCP_LogWriteAndList(t *testing.T) {
 		}
 	}
 
-	// Limit + offset.
 	body = callTool(t, sess, "memory_log_list", logListArgs{Limit: 1, Offset: 1})
 	recs = nil
 	if err := json.Unmarshal([]byte(body), &recs); err != nil {
@@ -126,9 +186,9 @@ func TestMemoryMCP_LogWriteAndList(t *testing.T) {
 	}
 }
 
-func TestMemoryMCP_LogWriteRespectsCap(t *testing.T) {
+func TestMCP_LogWriteRespectsCap(t *testing.T) {
 	store := newStore(t, 2)
-	sess := dialMemoryMCP(t, store)
+	sess := dialMCP(t, store)
 	defer sess.Close()
 
 	for _, c := range []string{"a", "b", "c", "d"} {
@@ -148,9 +208,9 @@ func TestMemoryMCP_LogWriteRespectsCap(t *testing.T) {
 	}
 }
 
-func TestMemoryMCP_SummaryWriteEmptyDeletes(t *testing.T) {
+func TestMCP_SummaryWriteEmptyDeletes(t *testing.T) {
 	store := newStore(t, 10)
-	sess := dialMemoryMCP(t, store)
+	sess := dialMCP(t, store)
 	defer sess.Close()
 
 	callTool(t, sess, "memory_summary_write", summaryWriteArgs{Content: "to be deleted"})
@@ -160,9 +220,9 @@ func TestMemoryMCP_SummaryWriteEmptyDeletes(t *testing.T) {
 	}
 }
 
-func TestMemoryMCP_LogWriteReturnsRecord(t *testing.T) {
+func TestMCP_LogWriteReturnsRecord(t *testing.T) {
 	store := newStore(t, 10)
-	sess := dialMemoryMCP(t, store)
+	sess := dialMCP(t, store)
 	defer sess.Close()
 
 	body := callTool(t, sess, "memory_log_write", logWriteArgs{Content: "hello"})
@@ -173,7 +233,6 @@ func TestMemoryMCP_LogWriteReturnsRecord(t *testing.T) {
 	if rec.Content != "hello" || rec.ID == "" || rec.CreatedAt.IsZero() {
 		t.Fatalf("bad record: %+v", rec)
 	}
-	// IDs are hex.
 	if strings.TrimLeft(rec.ID, "0123456789abcdef") != "" {
 		t.Errorf("ID not hex: %q", rec.ID)
 	}

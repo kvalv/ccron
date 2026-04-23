@@ -2,10 +2,12 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // runCmd runs the top-level CLI against args (starting after the program
@@ -134,6 +136,40 @@ func TestCmdStatus_Default(t *testing.T) {
 		t.Fatalf("status returned error: %v", err)
 	}
 	for _, want := range []string{"alpha", "NEXT RUN", "never run", "broken", "parse error"} {
+		if !strings.Contains(stdout, want) {
+			t.Errorf("status missing %q:\n%s", want, stdout)
+		}
+	}
+}
+
+// TestStatus_SummaryColumn: seed a state file with a Summary and assert the
+// status table has a SUMMARY header and shows the seeded value.
+func TestStatus_SummaryColumn(t *testing.T) {
+	dir := t.TempDir()
+	writeJobFile(t, dir, "alpha", "0 9 * * *", "a")
+
+	stateDir := filepath.Join(dir, "state")
+	if err := os.MkdirAll(stateDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	state := RunState{
+		StartedAt:  now.Add(-time.Minute),
+		EndedAt:    now,
+		DurationMs: 60000,
+		ExitCode:   0,
+		Summary:    "added 3 PRs",
+	}
+	data, _ := json.Marshal(state)
+	if err := os.WriteFile(filepath.Join(stateDir, "alpha.json"), data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	stdout, _, err := runCmd(t, dir)
+	if err != nil {
+		t.Fatalf("status: %v", err)
+	}
+	for _, want := range []string{"SUMMARY", "added 3 PRs"} {
 		if !strings.Contains(stdout, want) {
 			t.Errorf("status missing %q:\n%s", want, stdout)
 		}

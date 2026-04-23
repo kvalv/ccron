@@ -54,7 +54,7 @@ ccron logs                     # show latest run log (across all jobs)
 ccron logs --job <job> -n 5    # last 5 runs of a specific job
 ```
 
-Running `ccron` with no arguments prints a status table. If any job file fails to parse, it's reported there too - no need to start the daemon to find out.
+Running `ccron` with no arguments prints a status table. If any job file fails to parse, it's reported there too - no need to start the daemon to find out. The `SUMMARY` column shows the short note the agent wrote via `run_summary_write` on its last run (empty if the tool wasn't called).
 
 Use `--base-dir` to specify the root directory for jobs (default `~/.claude/cron`).
 
@@ -113,6 +113,10 @@ When enabled, two things happen on every run:
 
 1. **Prompt includes previous memory**: A summary and the `memory_initial_records` last log records are prepended to the prompt in a `## Prior memory` block.
 2. **MCP server to access memory**: The agent has access to read and write the memory via MCP.
+
+## Run summary
+
+On every run, ccron exposes a `run_summary_write` MCP tool and appends a short instruction asking the agent to call it with a ≤80-char note describing what the run did. That note shows up in the `SUMMARY` column of the status table. The tool is always available — no configuration needed, no opt-in. Agents may skip it; the column is just empty in that case.
 
 ## Environment variables
 

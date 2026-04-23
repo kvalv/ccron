@@ -398,8 +398,13 @@ func TestRunner_MemoryPriming_EmptyStore(t *testing.T) {
 	if strings.Contains(prompt, "## Prior memory") {
 		t.Fatalf("empty store should produce no prime block:\n%s", prompt)
 	}
-	if prompt != "ORIGINAL BODY" {
-		t.Fatalf("expected prompt unchanged, got: %q", prompt)
+	// Prompt starts with the original body (no prime block prepended) but
+	// has the run-summary instruction appended. Assert both halves.
+	if !strings.HasPrefix(prompt, "ORIGINAL BODY") {
+		t.Fatalf("expected prompt to start with original body, got: %q", prompt)
+	}
+	if !strings.Contains(prompt, "Before you finish") {
+		t.Fatalf("expected run-summary instruction appended, got: %q", prompt)
 	}
 }
 
@@ -469,15 +474,13 @@ func TestRunner_MemoryMCP_ArgvAndConfig(t *testing.T) {
 	argsFile := filepath.Join(tmp, "args.txt")
 	promptFile := filepath.Join(tmp, "prompt.txt")
 	cfgSnapshot := filepath.Join(tmp, "mcp-config-snapshot.json")
-	// Fake claude snapshots the --mcp-config file into cfgSnapshot while still
-	// running, since the runner removes the original on return. $7 is the
-	// --mcp-config path: argv is -p <prompt> --output-format text --allowedTools <list> --mcp-config <path>.
+	// Fake claude snapshots the --mcp-config file while still running, since
+	// the runner removes the original on return.
 	installFakeClaude(t, fmt.Sprintf(`
 printf '%%s\n' "$@" > %q
 if [ "$1" = "-p" ]; then
   printf '%%s' "$2" > %q
 fi
-# Find --mcp-config and snapshot the file it points at.
 prev=""
 for arg in "$@"; do
   if [ "$prev" = "--mcp-config" ]; then
@@ -508,12 +511,10 @@ exit 0`, argsFile, promptFile, cfgSnapshot))
 		}
 	}
 
-	// --mcp-config must be present.
 	if !strings.Contains(a, "--mcp-config") {
 		t.Fatalf("argv missing --mcp-config:\n%s", a)
 	}
 
-	// The snapshot captures the config file's contents during the run.
 	cfgData, err := os.ReadFile(cfgSnapshot)
 	if err != nil {
 		t.Fatalf("mcp-config snapshot missing: %v", err)
@@ -522,23 +523,24 @@ exit 0`, argsFile, promptFile, cfgSnapshot))
 	if err := json.Unmarshal(cfgData, &cfg); err != nil {
 		t.Fatalf("mcp-config not valid JSON: %v\n%s", err, cfgData)
 	}
-	srv, ok := cfg.MCPServers[memoryMCPServerName]
+	srv, ok := cfg.MCPServers[mcpServerName]
 	if !ok {
-		t.Fatalf("mcp-config missing %s server: %s", memoryMCPServerName, cfgData)
+		t.Fatalf("mcp-config missing %s server: %s", mcpServerName, cfgData)
 	}
 	if srv.Command == "" {
 		t.Errorf("mcp-config server has empty command: %+v", srv)
 	}
-	// Args should include memory-mcp + --job mcp-job + --memory-dir + --max-records 50.
 	joined := strings.Join(srv.Args, " ")
-	for _, want := range []string{"memory-mcp", "--job", "mcp-job", "--memory-dir", "--max-records", "50"} {
+	for _, want := range []string{"mcp", "--memory-dir", "--max-records", "50"} {
 		if !strings.Contains(joined, want) {
 			t.Errorf("mcp-config args missing %q: %v", want, srv.Args)
 		}
 	}
+	if strings.Contains(joined, "memory-mcp") {
+		t.Errorf("mcp-config should use new 'mcp' subcommand, not 'memory-mcp': %v", srv.Args)
+	}
 
-	// And — the critical new invariant — the original config is removed after
-	// the run returns.
+	// Config file is removed after the run returns.
 	lines := strings.Split(a, "\n")
 	var cfgPath string
 	for i, l := range lines {
@@ -555,11 +557,28 @@ exit 0`, argsFile, promptFile, cfgSnapshot))
 	}
 }
 
-func TestRunner_MemoryDisabled_NoMCPArgs(t *testing.T) {
+// TestRunner_MemoryDisabled_MCPStillWired: memory off, but --mcp-config and
+// run_summary_write are still injected (the ccron server is always on).
+// Memory tool names must NOT leak into allowed_tools.
+func TestRunner_MemoryDisabled_MCPStillWired(t *testing.T) {
 	tmp := t.TempDir()
 	argsFile := filepath.Join(tmp, "args.txt")
 	promptFile := filepath.Join(tmp, "prompt.txt")
-	installFakeClaudeCapture(t, argsFile, promptFile)
+	cfgSnapshot := filepath.Join(tmp, "mcp-config-snapshot.json")
+	installFakeClaude(t, fmt.Sprintf(`
+printf '%%s\n' "$@" > %q
+if [ "$1" = "-p" ]; then
+  printf '%%s' "$2" > %q
+fi
+prev=""
+for arg in "$@"; do
+  if [ "$prev" = "--mcp-config" ]; then
+    cp "$arg" %q
+    break
+  fi
+  prev="$arg"
+done
+exit 0`, argsFile, promptFile, cfgSnapshot))
 
 	r := newTestRunner(t)
 	job := testJob("plain-job") // memory disabled
@@ -568,14 +587,43 @@ func TestRunner_MemoryDisabled_NoMCPArgs(t *testing.T) {
 	}
 	argv, _ := os.ReadFile(argsFile)
 	a := string(argv)
-	if strings.Contains(a, "--mcp-config") {
-		t.Errorf("argv should not have --mcp-config when memory disabled:\n%s", a)
+
+	if !strings.Contains(a, "--mcp-config") {
+		t.Errorf("argv should have --mcp-config even when memory disabled:\n%s", a)
+	}
+	if !strings.Contains(a, "mcp__ccron__run_summary_write") {
+		t.Errorf("argv should include run_summary_write tool:\n%s", a)
 	}
 	for _, name := range memoryMCPToolNames {
 		if strings.Contains(a, name) {
 			t.Errorf("argv should not contain memory tool %q when memory disabled:\n%s", name, a)
 		}
 	}
+
+	// Config should omit memory flags when memory is disabled.
+	cfgData, err := os.ReadFile(cfgSnapshot)
+	if err != nil {
+		t.Fatalf("mcp-config snapshot missing: %v", err)
+	}
+	var cfg mcpConfig
+	if err := json.Unmarshal(cfgData, &cfg); err != nil {
+		t.Fatalf("mcp-config not valid JSON: %v", err)
+	}
+	srv := cfg.MCPServers[mcpServerName]
+	for _, bad := range []string{"--memory-dir", "--max-records"} {
+		if slicesContains(srv.Args, bad) {
+			t.Errorf("mcp-config args should omit %q when memory disabled: %v", bad, srv.Args)
+		}
+	}
+}
+
+func slicesContains(xs []string, x string) bool {
+	for _, s := range xs {
+		if s == x {
+			return true
+		}
+	}
+	return false
 }
 
 func TestRunner_SecretsInjection(t *testing.T) {
@@ -954,6 +1002,137 @@ func TestRunner_PreambleHasSecretEnv(t *testing.T) {
 	}
 	if !strings.Contains(string(logBytes), "***") {
 		t.Fatalf("expected *** redaction in log:\n%s", logBytes)
+	}
+}
+
+// installFakeClaudeStream writes a fake claude whose stdout is the given
+// stream-json body (one event per line). Useful for driving the summary
+// watcher without inventing a real claude.
+func installFakeClaudeStream(t *testing.T, streamBody string) {
+	t.Helper()
+	// The fake must emit a valid system/init event first (the runner probes
+	// for MCP tools via expandAllowedTools if any glob is present; none here)
+	// — but ccron ships the stream directly into the log and summary watcher
+	// without a probe for our default testJob. We only need stream lines.
+	tmp := t.TempDir()
+	streamFile := filepath.Join(tmp, "stream.txt")
+	if err := os.WriteFile(streamFile, []byte(streamBody), 0o644); err != nil {
+		t.Fatalf("write stream fixture: %v", err)
+	}
+	installFakeClaude(t, fmt.Sprintf(`cat %q; exit 0`, streamFile))
+}
+
+func TestRunner_Summary_Captured(t *testing.T) {
+	body := `{"type":"assistant","message":{"content":[` +
+		`{"type":"tool_use","name":"mcp__ccron__run_summary_write","input":{"content":"ran fine"}}` +
+		`]}}` + "\n"
+	installFakeClaudeStream(t, body)
+
+	r := newTestRunner(t)
+	if err := r.Run(t.Context(), testJob("sumjob")); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	state := readState(t, r, "sumjob")
+	if state.Summary != "ran fine" {
+		t.Fatalf("Summary = %q, want %q", state.Summary, "ran fine")
+	}
+}
+
+func TestRunner_Summary_LastWriteWins(t *testing.T) {
+	body := `{"type":"assistant","message":{"content":[` +
+		`{"type":"tool_use","name":"mcp__ccron__run_summary_write","input":{"content":"first"}}` +
+		`]}}` + "\n" +
+		`{"type":"assistant","message":{"content":[` +
+		`{"type":"tool_use","name":"mcp__ccron__run_summary_write","input":{"content":"second"}}` +
+		`]}}` + "\n"
+	installFakeClaudeStream(t, body)
+
+	r := newTestRunner(t)
+	if err := r.Run(t.Context(), testJob("lastwins")); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	state := readState(t, r, "lastwins")
+	if state.Summary != "second" {
+		t.Fatalf("Summary = %q, want %q", state.Summary, "second")
+	}
+}
+
+func TestRunner_Summary_Truncated(t *testing.T) {
+	long := strings.Repeat("x", 120)
+	body := `{"type":"assistant","message":{"content":[` +
+		`{"type":"tool_use","name":"mcp__ccron__run_summary_write","input":{"content":"` + long + `"}}` +
+		`]}}` + "\n"
+	installFakeClaudeStream(t, body)
+
+	r := newTestRunner(t)
+	if err := r.Run(t.Context(), testJob("truncjob")); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	state := readState(t, r, "truncjob")
+	if state.Summary != strings.Repeat("x", 80) {
+		t.Fatalf("Summary len=%d, want 80 x's (got %q)", len(state.Summary), state.Summary)
+	}
+}
+
+func TestRunner_Summary_Absent(t *testing.T) {
+	// Non-summary stream: just an empty assistant event and a result.
+	body := `{"type":"assistant","message":{"content":[]}}` + "\n" +
+		`{"type":"result","result":"ok"}` + "\n"
+	installFakeClaudeStream(t, body)
+
+	r := newTestRunner(t)
+	if err := r.Run(t.Context(), testJob("absentjob")); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	state := readState(t, r, "absentjob")
+	if state.Summary != "" {
+		t.Fatalf("Summary = %q, want empty", state.Summary)
+	}
+}
+
+func TestRunner_Summary_PromptHasInstruction(t *testing.T) {
+	tmp := t.TempDir()
+	argsFile := filepath.Join(tmp, "args.txt")
+	promptFile := filepath.Join(tmp, "prompt.txt")
+	installFakeClaudeCapture(t, argsFile, promptFile)
+
+	r := newTestRunner(t)
+	job := testJob("instrjob")
+	job.Prompt = "USER BODY"
+	if err := r.Run(t.Context(), job); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	pdata, err := os.ReadFile(promptFile)
+	if err != nil {
+		t.Fatalf("read prompt: %v", err)
+	}
+	prompt := string(pdata)
+
+	for _, want := range []string{"USER BODY", "Before you finish", "run_summary_write"} {
+		if !strings.Contains(prompt, want) {
+			t.Errorf("prompt missing %q:\n%s", want, prompt)
+		}
+	}
+	// Instruction appended, not prepended.
+	if strings.Index(prompt, "USER BODY") > strings.Index(prompt, "Before you finish") {
+		t.Fatalf("instruction should come after user body:\n%s", prompt)
+	}
+}
+
+func TestRunner_Summary_AllowedToolsAlwaysInjected(t *testing.T) {
+	tmp := t.TempDir()
+	argsFile := filepath.Join(tmp, "args.txt")
+	promptFile := filepath.Join(tmp, "prompt.txt")
+	installFakeClaudeCapture(t, argsFile, promptFile)
+
+	r := newTestRunner(t)
+	// A job with no memory: run_summary_write must still be wired in.
+	if err := r.Run(t.Context(), testJob("notmem")); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	argv, _ := os.ReadFile(argsFile)
+	if !strings.Contains(string(argv), "mcp__ccron__run_summary_write") {
+		t.Fatalf("run_summary_write missing from argv:\n%s", argv)
 	}
 }
 

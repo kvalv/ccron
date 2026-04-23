@@ -47,7 +47,7 @@ func buildApp() *cli.Command {
 			cmdExec(),
 			cmdValidate(),
 			cmdLogs(),
-			cmdMemoryMCP(),
+			cmdMCP(),
 		},
 	}
 }
@@ -79,7 +79,7 @@ func cmdStatus(ctx context.Context, cmd *cli.Command) error {
 	sort.Slice(parseErrors, func(i, j int) bool { return parseErrors[i].File < parseErrors[j].File })
 
 	w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
-	fmt.Fprintln(w, "NAME\tSCHEDULE\tNEXT RUN\tLAST RUN\tDURATION\tSTATUS")
+	fmt.Fprintln(w, "NAME\tSCHEDULE\tNEXT RUN\tLAST RUN\tDURATION\tSTATUS\tSUMMARY")
 
 	now := time.Now()
 	for _, job := range jobs {
@@ -88,7 +88,7 @@ func cmdStatus(ctx context.Context, cmd *cli.Command) error {
 			nextRun = sched.Next(now).Format("2006-01-02 15:04")
 		}
 
-		lastRun, duration, status := "-", "-", "never run"
+		lastRun, duration, status, summary := "-", "-", "never run", ""
 		if state, ok := runner.ReadState(job.Name); ok {
 			lastRun = state.StartedAt.Format("2006-01-02 15:04")
 			duration = (time.Duration(state.DurationMs) * time.Millisecond).Round(time.Millisecond).String()
@@ -97,15 +97,16 @@ func cmdStatus(ctx context.Context, cmd *cli.Command) error {
 			} else {
 				status = "FAIL"
 			}
+			summary = state.Summary
 		}
 
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\n",
-			job.Name, job.Schedule, nextRun, lastRun, duration, status)
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+			job.Name, job.Schedule, nextRun, lastRun, duration, status, summary)
 	}
 
 	for _, pe := range parseErrors {
 		name := strings.TrimSuffix(pe.File, ".md")
-		fmt.Fprintf(w, "%s\t-\t-\t-\t-\tparse error: %s\n", name, pe.Err.Error())
+		fmt.Fprintf(w, "%s\t-\t-\t-\t-\tparse error: %s\t\n", name, pe.Err.Error())
 	}
 
 	return w.Flush()
@@ -218,24 +219,27 @@ func cmdValidate() *cli.Command {
 	}
 }
 
-// cmdMemoryMCP is the hidden subcommand spawned by the runner as a stdio MCP
-// server for a single job's memory store. Not user-facing; exposed only so
-// `claude --mcp-config <ours>` can launch it.
-func cmdMemoryMCP() *cli.Command {
+// cmdMCP is the hidden subcommand spawned by the runner as a stdio MCP server
+// for a single job. Always hosts the run_summary_write tool; additionally
+// hosts the memory_* tools when --memory-dir is provided. Not user-facing;
+// exposed only so `claude --mcp-config <ours>` can launch it.
+func cmdMCP() *cli.Command {
 	return &cli.Command{
-		Name:   "memory-mcp",
+		Name:   "mcp",
 		Hidden: true,
 		Flags: []cli.Flag{
-			&cli.StringFlag{Name: "job", Required: true},
-			&cli.StringFlag{Name: "memory-dir", Required: true},
-			&cli.IntFlag{Name: "max-records", Required: true},
+			&cli.StringFlag{Name: "memory-dir"},
+			&cli.IntFlag{Name: "max-records"},
 		},
 		Action: func(ctx context.Context, cmd *cli.Command) error {
-			store := &Store{
-				Dir: cmd.String("memory-dir"),
-				Cap: int(cmd.Int("max-records")),
+			var store *Store
+			if dir := cmd.String("memory-dir"); dir != "" {
+				store = &Store{
+					Dir: dir,
+					Cap: int(cmd.Int("max-records")),
+				}
 			}
-			server := buildMemoryMCPServer(store)
+			server := buildMCPServer(store)
 			return server.Run(ctx, &mcp.StdioTransport{})
 		},
 	}

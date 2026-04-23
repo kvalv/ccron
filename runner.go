@@ -45,7 +45,22 @@ type RunState struct {
 	DurationMs int64     `json:"duration_ms"`
 	ExitCode   int       `json:"exit_code"`
 	Error      string    `json:"error,omitempty"`
+	// Summary is the last-written value from run_summary_write, captured from
+	// claude's stream-json output. Empty when the agent didn't call the tool.
+	Summary string `json:"summary,omitempty"`
 }
+
+// runSummaryInstruction is appended to every prompt. It nudges the agent to
+// call run_summary_write before finishing. Appended (not prepended) so it's
+// the last thing in the context window, and because preamble expansion
+// already ran — backtick-bang sequences in this block would be literal
+// instruction text, not commands.
+const runSummaryInstruction = "\n\n---\n\n" +
+	"## Before you finish\n\n" +
+	"Call `run_summary_write` with a ≤80-char summary of what this run did " +
+	"(or \"no-op\" if nothing happened). It's shown in the `ccron` status " +
+	"table so the operator can see at a glance what you accomplished " +
+	"without opening the log.\n"
 
 func (r *Runner) Run(ctx context.Context, job Job) error {
 	jobDir := filepath.Join(r.LogDir, job.Name)
@@ -65,7 +80,10 @@ func (r *Runner) Run(ctx context.Context, job Job) error {
 	logger.Printf("starting job %q", job.Name)
 	logger.Printf("workdir: %s", job.Workdir)
 
-	var mcpConfigPath string
+	// Memory priming: prepend prior summary + recent log records to the
+	// prompt when memory is enabled for this job.
+	var memDir string
+	var maxRecords int
 	if job.Memory != nil {
 		store := r.memoryStore(job)
 		primeBlock, err := buildPrimeBlock(store, job.Memory.InitialRecords)
@@ -74,25 +92,33 @@ func (r *Runner) Run(ctx context.Context, job Job) error {
 		} else if primeBlock != "" {
 			job.Prompt = primeBlock + job.Prompt
 		}
+		memDir = store.Dir
+		maxRecords = job.Memory.MaxRecords
+	}
 
-		selfExe, err := os.Executable()
-		if err != nil {
-			logger.Printf("os.Executable: %v", err)
-			return r.finishRun(job, time.Now(), time.Now(), -1, fmt.Errorf("os.Executable: %w", err))
+	// MCP config is always written — the ccron server hosts run_summary_write
+	// unconditionally, plus memory tools when enabled.
+	selfExe, err := os.Executable()
+	if err != nil {
+		logger.Printf("os.Executable: %v", err)
+		return r.finishRun(job, time.Now(), time.Now(), -1, "", fmt.Errorf("os.Executable: %w", err))
+	}
+	mcpConfigPath := filepath.Join(jobDir, ts+".mcp-config.json")
+	if err := writeMCPConfig(mcpConfigPath, selfExe, memDir, maxRecords); err != nil {
+		logger.Printf("write mcp-config: %v", err)
+		return r.finishRun(job, time.Now(), time.Now(), -1, "", fmt.Errorf("write mcp-config: %w", err))
+	}
+	defer func() {
+		if err := os.Remove(mcpConfigPath); err != nil && !os.IsNotExist(err) {
+			logger.Printf("remove mcp-config: %v", err)
 		}
-		mcpConfigPath = filepath.Join(jobDir, ts+".mcp-config.json")
-		if err := writeMemoryMCPConfig(mcpConfigPath, selfExe, job.Name, store.Dir, job.Memory.MaxRecords); err != nil {
-			logger.Printf("write mcp-config: %v", err)
-			return r.finishRun(job, time.Now(), time.Now(), -1, fmt.Errorf("write mcp-config: %w", err))
-		}
-		defer func() {
-			if err := os.Remove(mcpConfigPath); err != nil && !os.IsNotExist(err) {
-				logger.Printf("remove mcp-config: %v", err)
-			}
-		}()
-		// Inject the four memory tool names into allowed_tools. They have no
-		// `*` so expandAllowedTools passes them through verbatim.
-		job.AllowedTools = append(append([]string{}, job.AllowedTools...), memoryMCPToolNames...)
+	}()
+
+	// Always expose run_summary_write; add memory tools only when enabled.
+	// Names have no `*` so expandAllowedTools passes them through verbatim.
+	job.AllowedTools = append(append([]string{}, job.AllowedTools...), runMCPToolNames...)
+	if job.Memory != nil {
+		job.AllowedTools = append(job.AllowedTools, memoryMCPToolNames...)
 	}
 
 	// Resolve secrets before logging the prompt or spawning claude so that
@@ -106,7 +132,7 @@ func (r *Runner) Run(ctx context.Context, job Job) error {
 			abortErr := fmt.Errorf("load .env: %w", err)
 			logger.Printf("%v", abortErr)
 			now := time.Now()
-			if writeErr := r.finishRun(job, now, now, -1, abortErr); writeErr != nil {
+			if writeErr := r.finishRun(job, now, now, -1, "", abortErr); writeErr != nil {
 				log.Printf("write state for %q: %v", job.Name, writeErr)
 			}
 			return abortErr
@@ -116,7 +142,7 @@ func (r *Runner) Run(ctx context.Context, job Job) error {
 			abortErr := fmt.Errorf("resolve secrets: %w", err)
 			logger.Printf("%v", abortErr)
 			now := time.Now()
-			if writeErr := r.finishRun(job, now, now, -1, abortErr); writeErr != nil {
+			if writeErr := r.finishRun(job, now, now, -1, "", abortErr); writeErr != nil {
 				log.Printf("write state for %q: %v", job.Name, writeErr)
 			}
 			return abortErr
@@ -157,18 +183,20 @@ func (r *Runner) Run(ctx context.Context, job Job) error {
 		job.Prompt = buildSecretsPreamble(job.Secrets) + job.Prompt
 	}
 
+	// Append the run-summary instruction. Done after preamble expansion so
+	// backtick-bang sequences in the instruction text stay literal.
+	job.Prompt = job.Prompt + runSummaryInstruction
+
 	logger.Printf("prompt: %s", job.Prompt)
 
 	allowedTools, err := expandAllowedTools(runCtx, job.AllowedTools)
 	if err != nil {
 		logger.Printf("expand allowed_tools: %v", err)
-		return r.finishRun(job, time.Now(), time.Now(), -1, fmt.Errorf("expand allowed_tools: %w", err))
+		return r.finishRun(job, time.Now(), time.Now(), -1, "", fmt.Errorf("expand allowed_tools: %w", err))
 	}
 
 	args := job.ClaudeArgs(allowedTools)
-	if mcpConfigPath != "" {
-		args = append(args, "--mcp-config", mcpConfigPath)
-	}
+	args = append(args, "--mcp-config", mcpConfigPath)
 	cmd := exec.CommandContext(runCtx, "claude", args...)
 	cmd.Dir = job.Workdir
 	if len(secretEnv) > 0 {
@@ -176,7 +204,9 @@ func (r *Runner) Run(ctx context.Context, job Job) error {
 	}
 	// stdout is stream-json NDJSON. Raw to the log file (full fidelity for
 	// later inspection / jq / debugging); a pretty summary to os.Stdout so
-	// `ccron exec` and the daemon's journal show human-readable progress.
+	// `ccron exec` and the daemon's journal show human-readable progress; and
+	// a third tee to the summary-watcher, which plucks run_summary_write
+	// tool_use events straight off the wire.
 	renderPR, renderPW := io.Pipe()
 	renderDone := make(chan struct{})
 	go func() {
@@ -185,7 +215,14 @@ func (r *Runner) Run(ctx context.Context, job Job) error {
 			logger.Printf("render events: %v", err)
 		}
 	}()
-	cmd.Stdout = io.MultiWriter(logW, renderPW)
+	summaryPR, summaryPW := io.Pipe()
+	summaryDone := make(chan struct{})
+	var summary string
+	go func() {
+		defer close(summaryDone)
+		summary = watchSummary(summaryPR)
+	}()
+	cmd.Stdout = io.MultiWriter(logW, renderPW, summaryPW)
 	cmd.Stderr = io.MultiWriter(logW, stderrW)
 	// Run in its own process group so a timeout kills grand-children too
 	// (e.g. a shell that forked `sleep`), otherwise the re-parented child
@@ -204,12 +241,14 @@ func (r *Runner) Run(ctx context.Context, job Job) error {
 	end := time.Now()
 	elapsed := end.Sub(start)
 
-	// Closing the pipe writer signals EOF to the renderer goroutine so it
-	// finishes draining and exits. Wait for it before returning so the
-	// renderer's last line isn't interleaved with whatever the caller
-	// prints next.
+	// Closing the pipe writers signals EOF to both consumer goroutines so
+	// they finish draining and exit. Wait for them before returning so their
+	// last line isn't interleaved with whatever the caller prints next, and
+	// so `summary` is safely populated before we persist state.
 	_ = renderPW.Close()
+	_ = summaryPW.Close()
 	<-renderDone
+	<-summaryDone
 
 	exitCode := 0
 	if runErr != nil {
@@ -223,18 +262,19 @@ func (r *Runner) Run(ctx context.Context, job Job) error {
 		logger.Printf("job %q completed in %s", job.Name, elapsed)
 	}
 
-	if writeErr := r.finishRun(job, start, end, exitCode, runErr); writeErr != nil {
+	if writeErr := r.finishRun(job, start, end, exitCode, summary, runErr); writeErr != nil {
 		log.Printf("write state for %q: %v", job.Name, writeErr)
 	}
 	return runErr
 }
 
-func (r *Runner) finishRun(job Job, start, end time.Time, exitCode int, runErr error) error {
+func (r *Runner) finishRun(job Job, start, end time.Time, exitCode int, summary string, runErr error) error {
 	state := RunState{
 		StartedAt:  start,
 		EndedAt:    end,
 		DurationMs: end.Sub(start).Milliseconds(),
 		ExitCode:   exitCode,
+		Summary:    summary,
 	}
 	if runErr != nil {
 		state.Error = runErr.Error()

@@ -255,6 +255,11 @@ func cmdLogs() *cli.Command {
 				Value:   1,
 				Usage:   "number of recent runs to show",
 			},
+			&cli.BoolFlag{
+				Name:    "follow",
+				Aliases: []string{"f"},
+				Usage:   "follow the latest log as lines are written (raw output); switches to newer runs as they start. Ignores --tail",
+			},
 		},
 		Action: func(ctx context.Context, cmd *cli.Command) error {
 			_, _, runner, err := loadFromCtx(ctx, cmd)
@@ -263,6 +268,10 @@ func cmdLogs() *cli.Command {
 			}
 
 			jobFilter := cmd.String("job")
+			if cmd.Bool("follow") {
+				return followLogs(ctx, runner, jobFilter)
+			}
+
 			n := int(cmd.Int("tail"))
 
 			var logs []string

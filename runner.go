@@ -20,15 +20,17 @@ import (
 )
 
 type Runner struct {
+	BaseDir   string
 	LogDir    string
 	StateDir  string
 	MemoryDir string
 }
 
 // NewRunner derives the runtime subdirs (logs/, state/, memory/) under base.
-// Job *.md files live at the top of base itself.
+// Job *.md files and .env live at the top of base itself.
 func NewRunner(base string) *Runner {
 	return &Runner{
+		BaseDir:   base,
 		LogDir:    filepath.Join(base, "logs"),
 		StateDir:  filepath.Join(base, "state"),
 		MemoryDir: filepath.Join(base, "memory"),
@@ -93,6 +95,44 @@ func (r *Runner) Run(ctx context.Context, job Job) error {
 		job.AllowedTools = append(append([]string{}, job.AllowedTools...), memoryMCPToolNames...)
 	}
 
+	// Resolve secrets before logging the prompt or spawning claude so that
+	// any declared secret value baked into the prompt is redacted from the
+	// log on the way down.
+	var secretEnv []string
+	var secretValues []string
+	if len(job.Secrets) > 0 {
+		envMap, err := loadEnvFile(filepath.Join(r.BaseDir, ".env"))
+		if err != nil {
+			abortErr := fmt.Errorf("load .env: %w", err)
+			logger.Printf("%v", abortErr)
+			now := time.Now()
+			if writeErr := r.finishRun(job, now, now, -1, abortErr); writeErr != nil {
+				log.Printf("write state for %q: %v", job.Name, writeErr)
+			}
+			return abortErr
+		}
+		secretEnv, secretValues, err = resolveSecrets(envMap, job.Secrets)
+		if err != nil {
+			abortErr := fmt.Errorf("resolve secrets: %w", err)
+			logger.Printf("%v", abortErr)
+			now := time.Now()
+			if writeErr := r.finishRun(job, now, now, -1, abortErr); writeErr != nil {
+				log.Printf("write state for %q: %v", job.Name, writeErr)
+			}
+			return abortErr
+		}
+		logger.Printf("secrets: %v", job.Secrets)
+	}
+
+	// From here on, route log and stderr through a redactor so declared
+	// secret values don't land on disk or the operator's terminal. Applies
+	// only to values we know about — anything the agent discovers on its
+	// own (e.g. by cat-ing .env) is not redacted.
+	logW := newRedactingWriter(logFile, secretValues)
+	stderrW := newRedactingWriter(os.Stderr, secretValues)
+	stdoutW := newRedactingWriter(os.Stdout, secretValues)
+	logger = log.New(logW, "", log.LstdFlags)
+
 	logger.Printf("prompt: %s", job.Prompt)
 
 	runCtx := ctx
@@ -114,6 +154,9 @@ func (r *Runner) Run(ctx context.Context, job Job) error {
 	}
 	cmd := exec.CommandContext(runCtx, "claude", args...)
 	cmd.Dir = job.Workdir
+	if len(secretEnv) > 0 {
+		cmd.Env = append(os.Environ(), secretEnv...)
+	}
 	// stdout is stream-json NDJSON. Raw to the log file (full fidelity for
 	// later inspection / jq / debugging); a pretty summary to os.Stdout so
 	// `ccron exec` and the daemon's journal show human-readable progress.
@@ -121,12 +164,12 @@ func (r *Runner) Run(ctx context.Context, job Job) error {
 	renderDone := make(chan struct{})
 	go func() {
 		defer close(renderDone)
-		if err := RenderEvents(renderPR, os.Stdout); err != nil {
+		if err := RenderEvents(renderPR, stdoutW); err != nil {
 			logger.Printf("render events: %v", err)
 		}
 	}()
-	cmd.Stdout = io.MultiWriter(logFile, renderPW)
-	cmd.Stderr = io.MultiWriter(logFile, os.Stderr)
+	cmd.Stdout = io.MultiWriter(logW, renderPW)
+	cmd.Stderr = io.MultiWriter(logW, stderrW)
 	// Run in its own process group so a timeout kills grand-children too
 	// (e.g. a shell that forked `sleep`), otherwise the re-parented child
 	// keeps the stdout pipe open and cmd.Wait blocks forever.

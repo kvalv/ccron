@@ -8,7 +8,10 @@ require (
 	gopkg.in/yaml.v3 v3.0.1
 )
 
-require golang.org/x/term v0.42.0 // indirect
+require (
+	github.com/joho/godotenv v1.5.1 // indirect
+	golang.org/x/term v0.42.0 // indirect
+)
 
 require (
 	github.com/google/jsonschema-go v0.4.2 // indirect

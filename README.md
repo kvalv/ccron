@@ -114,6 +114,30 @@ When enabled, two things happen on every run:
 1. **Prompt includes previous memory**: A summary and the `memory_initial_records` last log records are prepended to the prompt in a `## Prior memory` block.
 2. **MCP server to access memory**: The agent has access to read and write the memory via MCP.
 
+## Environment variables
+
+Jobs can pull env vars from `<base-dir>/.env`, e.g. `~/claude/cron/.env`.
+
+```
+# <base-dir>/.env
+OPENAI_API_KEY=sk-...
+```
+
+```yaml
+---
+secrets:
+  - OPENAI_API_KEY
+  - HOME_ASSISTANT_API_KEY
+---
+
+Use $HOME_ASSISTANT_API_KEY to notify me when the house burns.
+```
+
+`.env` is re-read on each run. Declared values are redacted from logs as `***`. Missing names abort the run. `.env` must be mode `0600`.
+
+**Note**: If Claude has access to `Bash` or `Read`, they can still access secrets. This is
+just a convenience for not having to manage secrets in the prompt.
+
 ## Logs
 
 Written to `~/.claude/cron/logs/<job>/<timestamp>.log`
@@ -122,7 +146,9 @@ Each run creates a new log file with the job output and timing. Logs older than 
 
 ## Reloading
 
-The daemon rescans the jobs directory every 30 seconds, so adding, editing, or deleting `.md` files is picked up automatically - no restart needed. To force an immediate reload, send `SIGHUP`:
+The daemon rescans the jobs directory every 30 seconds, so adding, editing, or deleting `.md` files is picked up automatically.
+
+If you really want to force an immediate reload, send `SIGHUP`:
 
 ```bash
 systemctl --user reload ccron

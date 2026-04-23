@@ -340,6 +340,67 @@ body
 `,
 			check: errContains("memory disabled"),
 		},
+		{
+			desc: "secrets list",
+			content: `---
+schedule: "* * * * *"
+workdir: /tmp
+allowed_tools: [Read]
+secrets: [HA_TOKEN, OPENAI_API_KEY]
+---
+body
+`,
+			check: func(t *testing.T, j Job, err error) {
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				if len(j.Secrets) != 2 || j.Secrets[0] != "HA_TOKEN" || j.Secrets[1] != "OPENAI_API_KEY" {
+					t.Fatalf("secrets: %v", j.Secrets)
+				}
+			},
+		},
+		{
+			desc: "secrets omitted yields nil",
+			content: `---
+schedule: "* * * * *"
+workdir: /tmp
+allowed_tools: [Read]
+---
+body
+`,
+			check: func(t *testing.T, j Job, err error) {
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				if len(j.Secrets) != 0 {
+					t.Fatalf("secrets: %v", j.Secrets)
+				}
+			},
+		},
+		{
+			desc: "secrets duplicate rejected",
+			content: `---
+schedule: "* * * * *"
+workdir: /tmp
+allowed_tools: [Read]
+secrets: [FOO, FOO]
+---
+body
+`,
+			check: errContains("duplicate"),
+		},
+		{
+			desc: "secrets empty string rejected",
+			content: `---
+schedule: "* * * * *"
+workdir: /tmp
+allowed_tools: [Read]
+secrets: [FOO, ""]
+---
+body
+`,
+			check: errContains("empty"),
+		},
 	}
 
 	for _, tc := range cases {

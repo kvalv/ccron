@@ -25,6 +25,7 @@ type Job struct {
 	EnabledIf    []string
 	Prompt       string
 	Memory       *MemoryConfig
+	Secrets      []string
 }
 
 type JobError struct {
@@ -45,6 +46,7 @@ type frontmatter struct {
 	EnabledIf            yaml.Node `yaml:"enabled_if"`
 	Memory               int       `yaml:"memory"`
 	MemoryInitialRecords *int      `yaml:"memory_initial_records"`
+	Secrets              []string  `yaml:"secrets"`
 }
 
 // decodeEnabledIf accepts either a scalar string or a sequence of strings. An
@@ -179,6 +181,17 @@ func parseJobFile(path string) (Job, error) {
 		return Job{}, err
 	}
 
+	seen := make(map[string]struct{}, len(front.Secrets))
+	for _, s := range front.Secrets {
+		if strings.TrimSpace(s) == "" {
+			return Job{}, fmt.Errorf("secrets: empty name")
+		}
+		if _, dup := seen[s]; dup {
+			return Job{}, fmt.Errorf("secrets: duplicate name %q", s)
+		}
+		seen[s] = struct{}{}
+	}
+
 	return Job{
 		Name:         name,
 		Schedule:     front.Schedule,
@@ -189,6 +202,7 @@ func parseJobFile(path string) (Job, error) {
 		EnabledIf:    enabledIf,
 		Prompt:       prompt,
 		Memory:       mem,
+		Secrets:      front.Secrets,
 	}, nil
 }
 

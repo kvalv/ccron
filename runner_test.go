@@ -578,6 +578,141 @@ func TestRunner_MemoryDisabled_NoMCPArgs(t *testing.T) {
 	}
 }
 
+func TestRunner_SecretsInjection(t *testing.T) {
+	envFile := filepath.Join(t.TempDir(), "claude-env.txt")
+	installFakeClaude(t, fmt.Sprintf(`env > %q; exit 0`, envFile))
+
+	r := newTestRunner(t)
+	envPath := filepath.Join(r.BaseDir, ".env")
+	if err := os.WriteFile(envPath, []byte("HA_TOKEN=secret-abc\nOTHER=ignored\n"), 0o600); err != nil {
+		t.Fatalf("write .env: %v", err)
+	}
+
+	job := testJob("secret-job")
+	job.Secrets = []string{"HA_TOKEN"}
+	if err := r.Run(t.Context(), job); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	data, err := os.ReadFile(envFile)
+	if err != nil {
+		t.Fatalf("read env dump: %v", err)
+	}
+	if !strings.Contains(string(data), "HA_TOKEN=secret-abc") {
+		t.Fatalf("child env missing HA_TOKEN:\n%s", data)
+	}
+	if strings.Contains(string(data), "OTHER=ignored") {
+		t.Fatalf("undeclared secret leaked to child env:\n%s", data)
+	}
+}
+
+func TestRunner_SecretsMissingAborts(t *testing.T) {
+	// Fake claude would exit 0 if invoked; we assert it never runs by
+	// checking for the existence of a sentinel file it would touch.
+	touched := filepath.Join(t.TempDir(), "touched")
+	installFakeClaude(t, fmt.Sprintf(`touch %q; exit 0`, touched))
+
+	r := newTestRunner(t)
+	envPath := filepath.Join(r.BaseDir, ".env")
+	if err := os.WriteFile(envPath, []byte("HA_TOKEN=x\n"), 0o600); err != nil {
+		t.Fatalf("write .env: %v", err)
+	}
+
+	job := testJob("missing-secret-job")
+	job.Secrets = []string{"HA_TOKEN", "NOT_THERE"}
+	err := r.Run(t.Context(), job)
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "NOT_THERE") {
+		t.Fatalf("error should name missing key: %v", err)
+	}
+	if _, err := os.Stat(touched); err == nil {
+		t.Fatal("claude should not have been spawned when secrets are missing")
+	}
+}
+
+func TestRunner_SecretsEnvWrongPerms(t *testing.T) {
+	installFakeClaude(t, `exit 0`)
+	r := newTestRunner(t)
+	envPath := filepath.Join(r.BaseDir, ".env")
+	if err := os.WriteFile(envPath, []byte("HA_TOKEN=x\n"), 0o644); err != nil {
+		t.Fatalf("write .env: %v", err)
+	}
+
+	job := testJob("bad-perms-job")
+	job.Secrets = []string{"HA_TOKEN"}
+	err := r.Run(t.Context(), job)
+	if err == nil {
+		t.Fatal("expected error for wide perms, got nil")
+	}
+	if !strings.Contains(err.Error(), "mode") {
+		t.Fatalf("error should mention mode: %v", err)
+	}
+}
+
+func TestRunner_SecretsLogRedaction(t *testing.T) {
+	const secret = "secret-abc-xyz"
+	cases := []struct {
+		desc   string
+		prompt string
+		script string // fake claude body
+	}{
+		{
+			desc:   "secret in prompt is redacted",
+			prompt: "please use the token " + secret + " to call the API",
+			script: `exit 0`,
+		},
+		{
+			desc:   "secret in claude stdout is redacted",
+			prompt: "hello",
+			script: `echo "the token is ` + secret + `"; exit 0`,
+		},
+		{
+			desc:   "secret in claude stderr is redacted",
+			prompt: "hello",
+			script: `echo "oops ` + secret + ` escaped" 1>&2; exit 0`,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.desc, func(t *testing.T) {
+			installFakeClaude(t, tc.script)
+			r := newTestRunner(t)
+			envPath := filepath.Join(r.BaseDir, ".env")
+			if err := os.WriteFile(envPath, []byte("HA_TOKEN="+secret+"\n"), 0o600); err != nil {
+				t.Fatalf("write .env: %v", err)
+			}
+
+			job := testJob("redact-job")
+			job.Prompt = tc.prompt
+			job.Secrets = []string{"HA_TOKEN"}
+			if err := r.Run(t.Context(), job); err != nil {
+				t.Fatalf("Run: %v", err)
+			}
+
+			logsDir := filepath.Join(r.LogDir, "redact-job")
+			entries, err := os.ReadDir(logsDir)
+			if err != nil {
+				t.Fatalf("read log dir: %v", err)
+			}
+			if len(entries) != 1 {
+				t.Fatalf("expected 1 log file, got %d", len(entries))
+			}
+			data, err := os.ReadFile(filepath.Join(logsDir, entries[0].Name()))
+			if err != nil {
+				t.Fatalf("read log: %v", err)
+			}
+			if strings.Contains(string(data), secret) {
+				t.Fatalf("secret leaked to log:\n%s", data)
+			}
+			if !strings.Contains(string(data), "***") {
+				t.Fatalf("expected *** redaction in log:\n%s", data)
+			}
+		})
+	}
+}
+
 func TestGlobMatch(t *testing.T) {
 	cases := []struct {
 		desc, pattern, s string

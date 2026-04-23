@@ -112,7 +112,18 @@ func (r *Runner) Run(ctx context.Context, job Job) error {
 	}
 	cmd := exec.CommandContext(runCtx, "claude", args...)
 	cmd.Dir = job.Workdir
-	cmd.Stdout = io.MultiWriter(logFile, os.Stdout)
+	// stdout is stream-json NDJSON. Raw to the log file (full fidelity for
+	// later inspection / jq / debugging); a pretty summary to os.Stdout so
+	// `ccron exec` and the daemon's journal show human-readable progress.
+	renderPR, renderPW := io.Pipe()
+	renderDone := make(chan struct{})
+	go func() {
+		defer close(renderDone)
+		if err := RenderEvents(renderPR, os.Stdout); err != nil {
+			logger.Printf("render events: %v", err)
+		}
+	}()
+	cmd.Stdout = io.MultiWriter(logFile, renderPW)
 	cmd.Stderr = io.MultiWriter(logFile, os.Stderr)
 	// Run in its own process group so a timeout kills grand-children too
 	// (e.g. a shell that forked `sleep`), otherwise the re-parented child
@@ -130,6 +141,13 @@ func (r *Runner) Run(ctx context.Context, job Job) error {
 	runErr := cmd.Run()
 	end := time.Now()
 	elapsed := end.Sub(start)
+
+	// Closing the pipe writer signals EOF to the renderer goroutine so it
+	// finishes draining and exits. Wait for it before returning so the
+	// renderer's last line isn't interleaved with whatever the caller
+	// prints next.
+	_ = renderPW.Close()
+	<-renderDone
 
 	exitCode := 0
 	if runErr != nil {

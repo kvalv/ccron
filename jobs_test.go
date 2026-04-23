@@ -3,6 +3,7 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -404,14 +405,21 @@ no workdir
 func TestJob_CheckEnabled(t *testing.T) {
 	cases := []struct {
 		desc      string
-		enabledIf string
+		enabledIf []string
 		want      bool
 	}{
-		{"empty means enabled", "", true},
-		{"true command enables", "true", true},
-		{"false command disables", "false", false},
-		{"hostname match", `[ -n "$PATH" ]`, true},
-		{"impossible condition disables", `[ 1 -eq 2 ]`, false},
+		{"nil means enabled", nil, true},
+		{"empty slice means enabled", []string{}, true},
+		{"single true enables", []string{"true"}, true},
+		{"single false disables", []string{"false"}, false},
+		{"env check", []string{`[ -n "$PATH" ]`}, true},
+		{"impossible condition disables", []string{`[ 1 -eq 2 ]`}, false},
+
+		// Multi-condition (AND) semantics.
+		{"all true enables", []string{"true", "true", `[ 1 -eq 1 ]`}, true},
+		{"first false short-circuits", []string{"false", "true"}, false},
+		{"middle false disables", []string{"true", "false", "true"}, false},
+		{"last false disables", []string{"true", "true", "false"}, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.desc, func(t *testing.T) {
@@ -422,6 +430,116 @@ func TestJob_CheckEnabled(t *testing.T) {
 			}
 			if got != tc.want {
 				t.Fatalf("got %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestParseJob_EnabledIfShapes covers both shapes the YAML parser accepts:
+// a single string or a list of strings. Empty strings are elided; other
+// shapes (int, map, mixed) must error out.
+func TestParseJob_EnabledIfShapes(t *testing.T) {
+	cases := []struct {
+		desc    string
+		yaml    string
+		want    []string
+		wantErr string
+	}{
+		{
+			desc: "scalar string",
+			yaml: `
+schedule: "* * * * *"
+workdir: /tmp
+allowed_tools: [Read]
+enabled_if: "true"`,
+			want: []string{"true"},
+		},
+		{
+			desc: "omitted field yields nil",
+			yaml: `
+schedule: "* * * * *"
+workdir: /tmp
+allowed_tools: [Read]`,
+			want: nil,
+		},
+		{
+			desc: "empty string yields nil",
+			yaml: `
+schedule: "* * * * *"
+workdir: /tmp
+allowed_tools: [Read]
+enabled_if: ""`,
+			want: nil,
+		},
+		{
+			desc: "inline list",
+			yaml: `
+schedule: "* * * * *"
+workdir: /tmp
+allowed_tools: [Read]
+enabled_if: ["true", "false"]`,
+			want: []string{"true", "false"},
+		},
+		{
+			desc: "block list",
+			yaml: `
+schedule: "* * * * *"
+workdir: /tmp
+allowed_tools: [Read]
+enabled_if:
+  - 'true'
+  - '[ 1 -eq 1 ]'`,
+			want: []string{"true", "[ 1 -eq 1 ]"},
+		},
+		{
+			desc: "empty entry inside list errors",
+			yaml: `
+schedule: "* * * * *"
+workdir: /tmp
+allowed_tools: [Read]
+enabled_if:
+  - 'true'
+  - ''`,
+			wantErr: "empty condition",
+		},
+		{
+			desc: "wrong type errors",
+			yaml: `
+schedule: "* * * * *"
+workdir: /tmp
+allowed_tools: [Read]
+enabled_if:
+  nested: map`,
+			wantErr: "expected string or list",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.desc, func(t *testing.T) {
+			dir := t.TempDir()
+			writeJob(t, dir, "job.md", "---\n"+tc.yaml+"\n---\nbody\n")
+			jobs, perrs, err := LoadJobs(dir)
+			if err != nil {
+				t.Fatalf("LoadJobs: %v", err)
+			}
+			if tc.wantErr != "" {
+				if len(perrs) != 1 {
+					t.Fatalf("expected 1 parse error, got %d (%v)", len(perrs), perrs)
+				}
+				if !strings.Contains(perrs[0].Err.Error(), tc.wantErr) {
+					t.Fatalf("error %q does not contain %q", perrs[0].Err.Error(), tc.wantErr)
+				}
+				return
+			}
+			if len(perrs) != 0 {
+				t.Fatalf("unexpected parse errors: %v", perrs)
+			}
+			if len(jobs) != 1 {
+				t.Fatalf("expected 1 job, got %d", len(jobs))
+			}
+			got := jobs[0].EnabledIf
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Fatalf("got %#v, want %#v", got, tc.want)
 			}
 		})
 	}

@@ -22,7 +22,7 @@ type Job struct {
 	AllowedTools []string
 	Description  string
 	Timeout      time.Duration
-	EnabledIf    string
+	EnabledIf    []string
 	Prompt       string
 	Memory       *MemoryConfig
 }
@@ -37,14 +37,42 @@ func (e JobError) Error() string {
 }
 
 type frontmatter struct {
-	Schedule             string   `yaml:"schedule"`
-	Workdir              string   `yaml:"workdir"`
-	AllowedTools         []string `yaml:"allowed_tools"`
-	Description          string   `yaml:"description"`
-	Timeout              string   `yaml:"timeout"`
-	EnabledIf            string   `yaml:"enabled_if"`
-	Memory               int      `yaml:"memory"`
-	MemoryInitialRecords *int     `yaml:"memory_initial_records"`
+	Schedule             string    `yaml:"schedule"`
+	Workdir              string    `yaml:"workdir"`
+	AllowedTools         []string  `yaml:"allowed_tools"`
+	Description          string    `yaml:"description"`
+	Timeout              string    `yaml:"timeout"`
+	EnabledIf            yaml.Node `yaml:"enabled_if"`
+	Memory               int       `yaml:"memory"`
+	MemoryInitialRecords *int      `yaml:"memory_initial_records"`
+}
+
+// decodeEnabledIf accepts either a scalar string or a sequence of strings. An
+// absent field decodes to nil (no conditions). Any other shape is rejected.
+// Multiple conditions are ANDed together at run time.
+func decodeEnabledIf(node yaml.Node) ([]string, error) {
+	switch node.Kind {
+	case 0:
+		return nil, nil
+	case yaml.ScalarNode:
+		if node.Value == "" {
+			return nil, nil
+		}
+		return []string{node.Value}, nil
+	case yaml.SequenceNode:
+		var out []string
+		if err := node.Decode(&out); err != nil {
+			return nil, fmt.Errorf("enabled_if: %w", err)
+		}
+		for i, s := range out {
+			if strings.TrimSpace(s) == "" {
+				return nil, fmt.Errorf("enabled_if[%d]: empty condition", i)
+			}
+		}
+		return out, nil
+	default:
+		return nil, fmt.Errorf("enabled_if: expected string or list of strings")
+	}
 }
 
 const defaultMemoryInitialRecords = 10
@@ -146,6 +174,11 @@ func parseJobFile(path string) (Job, error) {
 		return Job{}, fmt.Errorf("memory_initial_records set but memory disabled (memory: 0)")
 	}
 
+	enabledIf, err := decodeEnabledIf(front.EnabledIf)
+	if err != nil {
+		return Job{}, err
+	}
+
 	return Job{
 		Name:         name,
 		Schedule:     front.Schedule,
@@ -153,31 +186,31 @@ func parseJobFile(path string) (Job, error) {
 		AllowedTools: front.AllowedTools,
 		Description:  front.Description,
 		Timeout:      timeout,
-		EnabledIf:    front.EnabledIf,
+		EnabledIf:    enabledIf,
 		Prompt:       prompt,
 		Memory:       mem,
 	}, nil
 }
 
-// CheckEnabled evaluates the job's enabled_if shell condition. Returns true
-// when there's no condition or when `sh -c <enabled_if>` exits 0. A non-zero
-// exit means disabled (not an error). Any other failure (couldn't spawn sh,
-// etc.) is returned as err.
+// CheckEnabled evaluates every enabled_if shell condition in order. All must
+// exit 0 for the job to run — a single non-zero exit short-circuits to
+// disabled. Returns true when there are no conditions. Any non-ExitError
+// failure (couldn't spawn sh, etc.) is returned as err.
 func (j Job) CheckEnabled(ctx context.Context) (bool, error) {
-	if j.EnabledIf == "" {
-		return true, nil
+	for _, cond := range j.EnabledIf {
+		cmd := exec.CommandContext(ctx, "sh", "-c", cond)
+		cmd.Dir = j.Workdir
+		err := cmd.Run()
+		if err == nil {
+			continue
+		}
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
+			return false, nil
+		}
+		return false, err
 	}
-	cmd := exec.CommandContext(ctx, "sh", "-c", j.EnabledIf)
-	cmd.Dir = j.Workdir
-	err := cmd.Run()
-	if err == nil {
-		return true, nil
-	}
-	var exitErr *exec.ExitError
-	if errors.As(err, &exitErr) {
-		return false, nil
-	}
-	return false, err
+	return true, nil
 }
 
 // splitFrontmatter extracts the first YAML frontmatter block delimited by "---"

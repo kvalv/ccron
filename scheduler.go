@@ -201,7 +201,7 @@ func jobHash(j Job) string {
 		Workdir      string
 		AllowedTools []string
 		Timeout      time.Duration
-		EnabledIf    string
+		EnabledIf    []string
 		Prompt       string
 		Memory       *MemoryConfig
 	}{j.Schedule, j.Workdir, j.AllowedTools, j.Timeout, j.EnabledIf, j.Prompt, j.Memory})

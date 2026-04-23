@@ -877,6 +877,86 @@ func TestListMCPTools_Integration(t *testing.T) {
 	}
 }
 
+func TestRunner_PreambleExpanded(t *testing.T) {
+	tmp := t.TempDir()
+	argsFile := filepath.Join(tmp, "args.txt")
+	promptFile := filepath.Join(tmp, "prompt.txt")
+	installFakeClaudeCapture(t, argsFile, promptFile)
+
+	r := newTestRunner(t)
+	job := testJob("preamble-job")
+	job.Prompt = "before !`echo INJECTED` after"
+
+	if err := r.Run(t.Context(), job); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	pdata, err := os.ReadFile(promptFile)
+	if err != nil {
+		t.Fatalf("read prompt: %v", err)
+	}
+	prompt := string(pdata)
+	if !strings.Contains(prompt, "before INJECTED after") {
+		t.Fatalf("preamble not expanded in prompt sent to claude:\n%s", prompt)
+	}
+	if strings.Contains(prompt, "!`echo INJECTED`") {
+		t.Fatalf("raw preamble syntax still present:\n%s", prompt)
+	}
+}
+
+func TestRunner_PreambleHasSecretEnv(t *testing.T) {
+	tmp := t.TempDir()
+	argsFile := filepath.Join(tmp, "args.txt")
+	promptFile := filepath.Join(tmp, "prompt.txt")
+	installFakeClaudeCapture(t, argsFile, promptFile)
+
+	r := newTestRunner(t)
+	envPath := filepath.Join(r.BaseDir, ".env")
+	if err := os.WriteFile(envPath, []byte("HA_TOKEN=tok-123\n"), 0o600); err != nil {
+		t.Fatalf("write .env: %v", err)
+	}
+
+	job := testJob("preamble-secret-job")
+	job.Secrets = []string{"HA_TOKEN"}
+	// Preamble command must see the resolved secret in its env.
+	job.Prompt = "token-is=!`printf %s \"$HA_TOKEN\"`"
+
+	if err := r.Run(t.Context(), job); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	pdata, err := os.ReadFile(promptFile)
+	if err != nil {
+		t.Fatalf("read prompt: %v", err)
+	}
+	prompt := string(pdata)
+	// The secret value is redacted in logs but the prompt sent to claude
+	// must still contain the real value (claude is the trusted consumer).
+	if !strings.Contains(prompt, "token-is=tok-123") {
+		t.Fatalf("preamble did not see resolved secret in env:\n%s", prompt)
+	}
+
+	// And the log file must have the secret redacted, not leaked.
+	logsDir := filepath.Join(r.LogDir, "preamble-secret-job")
+	entries, err := os.ReadDir(logsDir)
+	if err != nil {
+		t.Fatalf("read log dir: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("expected 1 log file, got %d", len(entries))
+	}
+	logBytes, err := os.ReadFile(filepath.Join(logsDir, entries[0].Name()))
+	if err != nil {
+		t.Fatalf("read log: %v", err)
+	}
+	if strings.Contains(string(logBytes), "tok-123") {
+		t.Fatalf("secret leaked to log:\n%s", logBytes)
+	}
+	if !strings.Contains(string(logBytes), "***") {
+		t.Fatalf("expected *** redaction in log:\n%s", logBytes)
+	}
+}
+
 func equalStrings(a, b []string) bool {
 	if len(a) != len(b) {
 		return false

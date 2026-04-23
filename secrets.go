@@ -5,9 +5,24 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 
 	"github.com/joho/godotenv"
 )
+
+// buildSecretsPreamble returns a short prompt prefix advertising which env
+// var names are populated for this run. Names only — values already live in
+// the child process env. Emitted when a job declares secrets so the agent
+// reaches for $NAME instead of reading .env directly.
+func buildSecretsPreamble(names []string) string {
+	if len(names) == 0 {
+		return ""
+	}
+	return fmt.Sprintf(
+		"## Environment variables\n\nThe following secrets are available as environment variables in this process: %s.\n\n",
+		strings.Join(names, ", "),
+	)
+}
 
 // loadEnvFile reads the .env file at path and returns its contents as a map.
 // The file must be mode 0600 — any wider and we refuse to load it.

@@ -203,6 +203,46 @@ func TestRedactingWriter(t *testing.T) {
 	}
 }
 
+func TestBuildSecretsPreamble(t *testing.T) {
+	cases := []struct {
+		desc    string
+		names   []string
+		wantHas []string // substrings that must appear; nil = expect empty string
+	}{
+		{
+			desc:  "empty list yields empty preamble",
+			names: nil,
+		},
+		{
+			desc:    "single name appears in preamble",
+			names:   []string{"HA_TOKEN"},
+			wantHas: []string{"HA_TOKEN", "Environment variables"},
+		},
+		{
+			desc:    "multiple names joined with commas",
+			names:   []string{"HA_TOKEN", "HA_URL"},
+			wantHas: []string{"HA_TOKEN, HA_URL"},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.desc, func(t *testing.T) {
+			got := buildSecretsPreamble(tc.names)
+			if tc.wantHas == nil {
+				if got != "" {
+					t.Fatalf("expected empty, got %q", got)
+				}
+				return
+			}
+			for _, sub := range tc.wantHas {
+				if !contains(got, sub) {
+					t.Fatalf("preamble missing %q:\n%s", sub, got)
+				}
+			}
+		})
+	}
+}
+
 func contains(s, sub string) bool {
 	return bytes.Contains([]byte(s), []byte(sub))
 }

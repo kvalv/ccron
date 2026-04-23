@@ -129,7 +129,6 @@ secrets:
   - OPENAI_API_KEY
   - HOME_ASSISTANT_API_KEY
 ---
-
 Use $HOME_ASSISTANT_API_KEY to notify me when the house burns.
 ```
 
@@ -137,6 +136,19 @@ Use $HOME_ASSISTANT_API_KEY to notify me when the house burns.
 
 **Note**: If Claude has access to `Bash` or `Read`, they can still access secrets. This is
 just a convenience for not having to manage secrets in the prompt.
+
+## Shell preamble
+
+Inline backtick-bang in the prompt body runs the command pre-send and inlines its stdout:
+
+```markdown
+Today is !`date +%F`.
+
+Recent PRs:
+!`gh pr list --json number,title --limit 5`
+```
+
+Commands run with `bash -c`, in the job's `workdir`, with the same env as the claude subprocess (including resolved secrets — `` !`curl -H "Authorization: Bearer $HA_TOKEN" ...` `` works). Per-command: 10s timeout, 8 KB output cap. A non-zero exit inlines `<command failed: ...>` rather than aborting the run; stderr is logged, not injected.
 
 ## Logs
 

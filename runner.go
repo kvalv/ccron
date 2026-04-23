@@ -133,14 +133,31 @@ func (r *Runner) Run(ctx context.Context, job Job) error {
 	stdoutW := newRedactingWriter(os.Stdout, secretValues)
 	logger = log.New(logW, "", log.LstdFlags)
 
-	logger.Printf("prompt: %s", job.Prompt)
-
 	runCtx := ctx
 	if job.Timeout > 0 {
 		var cancel context.CancelFunc
 		runCtx, cancel = context.WithTimeout(ctx, job.Timeout)
 		defer cancel()
 	}
+
+	// Expand !`cmd` shell preamble in the prompt body. Runs with the job's
+	// workdir and env (including resolved secrets) so author-supplied
+	// commands can reach $SECRET variables. Failures inline a marker rather
+	// than aborting the run.
+	pr := &preambleRunner{
+		Workdir: job.Workdir,
+		Env:     append(os.Environ(), secretEnv...),
+		Timeout: 10 * time.Second,
+		MaxOut:  8 << 10,
+		Log:     logger.Printf,
+	}
+	job.Prompt = pr.Expand(runCtx, job.Prompt)
+
+	if len(job.Secrets) > 0 {
+		job.Prompt = buildSecretsPreamble(job.Secrets) + job.Prompt
+	}
+
+	logger.Printf("prompt: %s", job.Prompt)
 
 	allowedTools, err := expandAllowedTools(runCtx, job.AllowedTools)
 	if err != nil {

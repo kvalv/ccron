@@ -217,8 +217,13 @@ func FindJob(jobs []Job, name string) (Job, bool) {
 
 // ClaudeArgs builds the argv for `claude -p`. allowedTools is passed
 // separately so the runner can substitute expanded MCP tool names for globs.
+//
+// Uses stream-json + verbose so each tool call, tool result, and assistant
+// message is flushed to stdout as it happens. This way `ccron exec` shows
+// live progress and the per-run log file can be tailed while a job runs,
+// instead of a single buffered dump at the end.
 func (j Job) ClaudeArgs(allowedTools []string) []string {
-	args := []string{"-p", j.Prompt, "--output-format", "text"}
+	args := []string{"-p", j.Prompt, "--output-format", "stream-json", "--verbose"}
 	if len(allowedTools) > 0 {
 		args = append(args, "--allowedTools", strings.Join(allowedTools, ","))
 	}
